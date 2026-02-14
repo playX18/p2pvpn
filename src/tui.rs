@@ -44,6 +44,7 @@ struct App {
     phase: Phase,
     status_msg: String,
     credentials: Option<OpenVpnCredentials>,
+    credentials_from_prompt: bool,
     active_session: Option<OpenVpnSession>,
     credential_field: CredentialField,
     username_input: String,
@@ -71,6 +72,7 @@ impl App {
             phase: Phase::Selecting,
             status_msg: String::from("Select a provider and press Enter to connect."),
             credentials,
+            credentials_from_prompt: false,
             active_session: None,
             credential_field: CredentialField::Username,
             username_input: String::new(),
@@ -289,6 +291,7 @@ pub async fn run(credentials: Option<OpenVpnCredentials>) -> anyhow::Result<()> 
                                         username: app.username_input.clone(),
                                         password: app.password_input.clone(),
                                     });
+                                    app.credentials_from_prompt = true;
                                     app.reset_prompt_state();
                                     app.phase = Phase::Connecting(idx);
                                     app.status_msg =
@@ -325,6 +328,11 @@ pub async fn run(credentials: Option<OpenVpnCredentials>) -> anyhow::Result<()> 
                         );
                     }
                     vpn::ConnectionAttempt::Failed(reason) => {
+                        if app.credentials_from_prompt {
+                            app.credentials = None;
+                            app.credentials_from_prompt = false;
+                            app.reset_prompt_state();
+                        }
                         app.providers[idx].failed = true;
                         app.status_msg = format!(
                             "✘ Connection to {} failed: {reason}. Select another provider.",
