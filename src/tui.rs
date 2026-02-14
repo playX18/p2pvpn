@@ -20,6 +20,7 @@ use crate::vpn;
 struct Provider {
     name: String,
     key: H256,
+    file_kind: &'static str,
     failed: bool,
 }
 
@@ -30,6 +31,7 @@ enum Phase {
 }
 
 struct App {
+    api: contract::Api,
     providers: Vec<Provider>,
     selected: usize,
     phase: Phase,
@@ -37,22 +39,27 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
-        let providers = contract::fetch_providers()
-            .into_iter()
-            .map(|(name, key)| Provider {
+    async fn new() -> anyhow::Result<Self> {
+        let api = contract::Api::new(None).await?;
+        let fetched = contract::fetch_providers(&api).await;
+        let mut built = Vec::with_capacity(fetched.len());
+        for (name, key) in fetched {
+            let file_kind = contract::fetch_provider_file(&api, key).await.kind();
+            built.push(Provider {
                 name,
                 key,
+                file_kind,
                 failed: false,
-            })
-            .collect::<Vec<_>>();
+            });
+        }
 
-        Self {
-            providers,
+        Ok(Self {
+            api,
+            providers: built,
             selected: 0,
             phase: Phase::Selecting,
             status_msg: String::from("Select a provider and press Enter to connect."),
-        }
+        })
     }
 
     /// Move selection up, skipping failed providers.
@@ -108,8 +115,7 @@ fn draw(frame: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let file = contract::fetch_provider_file(p.key);
-            let label = format!("{} [{}] ({})", p.name, p.key.short(), file.kind());
+            let label = format!("{} [{}] ({})", p.name, p.key.short(), p.file_kind);
 
             let style = if p.failed {
                 Style::default()
@@ -156,14 +162,14 @@ fn draw(frame: &mut Frame, app: &App) {
 // Event loop
 // ---------------------------------------------------------------------------
 
-pub fn run() -> anyhow::Result<()> {
+pub async fn run() -> anyhow::Result<()> {
     // Setup terminal.
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new().await?;
 
     loop {
         terminal.draw(|f| draw(f, &app))?;
@@ -198,7 +204,7 @@ pub fn run() -> anyhow::Result<()> {
                 terminal.draw(|f| draw(f, &app))?;
 
                 let provider = &app.providers[idx];
-                let success = vpn::try_connect(provider.key);
+                let success = vpn::try_connect(&app.api, provider.key).await;
 
                 if success {
                     app.phase = Phase::Connected;

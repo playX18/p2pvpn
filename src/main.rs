@@ -17,11 +17,12 @@ enum Commands {
     Connect,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Connect => tui::run()?,
+        Commands::Connect => tui::run().await?,
     }
 
     Ok(())
