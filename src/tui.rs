@@ -9,9 +9,10 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
+use tokio::task;
 
 use crate::contract::{self, H256};
-use crate::vpn;
+use crate::vpn::{self, OpenVpnCredentials, OpenVpnSession};
 
 // ---------------------------------------------------------------------------
 // App state
@@ -20,6 +21,7 @@ use crate::vpn;
 struct Provider {
     name: String,
     key: H256,
+    file_kind: String,
     failed: bool,
 }
 
@@ -34,24 +36,32 @@ struct App {
     selected: usize,
     phase: Phase,
     status_msg: String,
+    credentials: Option<OpenVpnCredentials>,
+    active_session: Option<OpenVpnSession>,
 }
 
 impl App {
-    fn new() -> Self {
-        let providers = contract::fetch_providers()
-            .into_iter()
-            .map(|(name, key)| Provider {
+    async fn new(credentials: Option<OpenVpnCredentials>) -> Self {
+        let provider_list = contract::fetch_providers().await;
+        let mut providers = Vec::with_capacity(provider_list.len());
+
+        for (name, key) in provider_list {
+            let file = contract::fetch_provider_file(key).await;
+            providers.push(Provider {
                 name,
                 key,
+                file_kind: file.kind().to_string(),
                 failed: false,
-            })
-            .collect::<Vec<_>>();
+            });
+        }
 
         Self {
             providers,
             selected: 0,
             phase: Phase::Selecting,
             status_msg: String::from("Select a provider and press Enter to connect."),
+            credentials,
+            active_session: None,
         }
     }
 
@@ -108,8 +118,7 @@ fn draw(frame: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let file = contract::fetch_provider_file(p.key);
-            let label = format!("{} [{}] ({})", p.name, p.key.short(), file.kind());
+            let label = format!("{} [{}] ({})", p.name, p.key.short(), p.file_kind);
 
             let style = if p.failed {
                 Style::default()
@@ -152,25 +161,29 @@ fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(status, chunks[1]);
 }
 
+fn read_event_blocking() -> anyhow::Result<Event> {
+    task::block_in_place(event::read).map_err(Into::into)
+}
+
 // ---------------------------------------------------------------------------
 // Event loop
 // ---------------------------------------------------------------------------
 
-pub fn run() -> anyhow::Result<()> {
+pub async fn run(credentials: Option<OpenVpnCredentials>) -> anyhow::Result<()> {
     // Setup terminal.
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new(credentials).await;
 
     loop {
         terminal.draw(|f| draw(f, &app))?;
 
         match &app.phase {
             Phase::Selecting => {
-                if let Event::Key(key) = event::read()? {
+                if let Event::Key(key) = read_event_blocking()? {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
@@ -198,35 +211,44 @@ pub fn run() -> anyhow::Result<()> {
                 terminal.draw(|f| draw(f, &app))?;
 
                 let provider = &app.providers[idx];
-                let success = vpn::try_connect(provider.key);
-
-                if success {
-                    app.phase = Phase::Connected;
-                    app.status_msg = format!(
-                        "✔ Connected to {}! Press q to disconnect & quit.",
-                        app.providers[idx].name
-                    );
-                } else {
-                    app.providers[idx].failed = true;
-                    app.status_msg = format!(
-                        "✘ Connection to {} failed. Select another provider.",
-                        app.providers[idx].name
-                    );
-                    app.fix_selection();
-                    app.phase = Phase::Selecting;
+                match vpn::try_connect(provider.key, app.credentials.as_ref()).await {
+                    vpn::ConnectionAttempt::Connected(session) => {
+                        app.active_session = Some(session);
+                        app.phase = Phase::Connected;
+                        app.status_msg = format!(
+                            "✔ Connected to {}! Press q to disconnect & quit.",
+                            app.providers[idx].name
+                        );
+                    }
+                    vpn::ConnectionAttempt::Failed(reason) => {
+                        app.providers[idx].failed = true;
+                        app.status_msg = format!(
+                            "✘ Connection to {} failed: {reason}. Select another provider.",
+                            app.providers[idx].name
+                        );
+                        app.fix_selection();
+                        app.phase = Phase::Selecting;
+                    }
                 }
             }
             Phase::Connected => {
-                if let Event::Key(key) = event::read()? {
+                if let Event::Key(key) = read_event_blocking()? {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
                     if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                        if let Some(session) = app.active_session.as_mut() {
+                            let _ = session.terminate().await;
+                        }
                         break;
                     }
                 }
             }
         }
+    }
+
+    if let Some(session) = app.active_session.as_mut() {
+        let _ = session.terminate().await;
     }
 
     // Restore terminal.

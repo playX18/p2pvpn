@@ -56,7 +56,7 @@ static PROVIDERS: &[(&str, u8)] = &[
 ];
 
 /// Fetch the list of available VPN providers.
-pub fn fetch_providers() -> Vec<(String, H256)> {
+pub async fn fetch_providers() -> Vec<(String, H256)> {
     PROVIDERS
         .iter()
         .map(|(name, seed)| (name.to_string(), mock_h256(*seed)))
@@ -64,23 +64,29 @@ pub fn fetch_providers() -> Vec<(String, H256)> {
 }
 
 /// Fetch the VPN configuration file for a given provider.
-pub fn fetch_provider_file(provider: H256) -> VpnFile {
-    // Alternate between WireGuard and OpenVPN based on the first byte.
-    let raw = format!(
-        "# Mock VPN config for provider {:02x}\n[Interface]\nAddress = 10.0.0.{}\n",
-        provider.0[0], provider.0[0]
-    )
-    .into_bytes();
-
+pub async fn fetch_provider_file(provider: H256) -> VpnFile {
     if provider.0[0] % 2 == 0 {
-        VpnFile::OpenVpn(raw)
+        let requires_auth = provider.0[0] % 4 == 0;
+        let mut config = format!(
+            "client\ndev tun\nproto udp\nremote 127.0.0.1 1194\nnobind\npersist-key\npersist-tun\nverb 3\n# provider {:02x}\n",
+            provider.0[0]
+        );
+        if requires_auth {
+            config.push_str("auth-user-pass\n");
+        }
+        VpnFile::OpenVpn(config.into_bytes())
     } else {
+        let raw = format!(
+            "# Mock VPN config for provider {:02x}\n[Interface]\nAddress = 10.0.0.{}\n",
+            provider.0[0], provider.0[0]
+        )
+        .into_bytes();
         VpnFile::Wireguard(raw)
     }
 }
 
 /// Rank a provider positively or negatively after a connection attempt.
-pub fn rank_provider(good: bool, _provider: H256) {
+pub async fn rank_provider(good: bool, _provider: H256) {
     // In a real implementation this would call a smart-contract transaction.
     let _action = if good { "upvoted" } else { "downvoted" };
 }
