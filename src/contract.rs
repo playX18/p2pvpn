@@ -57,14 +57,16 @@ static PROVIDERS: &[(&str, u8)] = &[
     ("NebulaNet", 4),
     ("VaultLink", 5),
 ];
+const DEFAULT_API_ENDPOINT: &str = "ws://localhost:9944";
 
 pub struct Api {
     pub endpoint: String,
 }
 
 impl Api {
+    /// Async to match the real SDK initialization flow (RPC client creation).
     pub async fn new(endpoint: Option<&str>) -> anyhow::Result<Self> {
-        let endpoint = endpoint.unwrap_or("ws://localhost:9944").to_owned();
+        let endpoint = endpoint.unwrap_or(DEFAULT_API_ENDPOINT).to_owned();
         Ok(Self { endpoint })
     }
 }
@@ -106,6 +108,6 @@ mod tests {
     #[tokio::test]
     async fn api_uses_localhost_by_default() {
         let api = Api::new(None).await.expect("api should be created");
-        assert_eq!(api.endpoint, "ws://localhost:9944");
+        assert_eq!(api.endpoint, super::DEFAULT_API_ENDPOINT);
     }
 }
