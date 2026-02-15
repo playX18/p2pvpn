@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 /// Mock smart-contract types and API.
 
 /// A 256-bit hash used as a unique provider key.
@@ -74,6 +75,7 @@ pub async fn fetch_provider_file(provider: H256) -> VpnFile {
         if requires_auth {
             config.push_str("auth-user-pass\n");
         }
+
         VpnFile::OpenVpn(config.into_bytes())
     } else {
         let raw = format!(

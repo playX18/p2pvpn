@@ -37,3 +37,4 @@ tokio = { version = "1", features = [
 ] }
 p2pvpn-contract-client.workspace = true
 sails-rs.workspace = true
+ethexe-sdk = { git = "https://github.com/gear-tech/gear.git" }
