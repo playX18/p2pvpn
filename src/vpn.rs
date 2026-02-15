@@ -1,17 +1,16 @@
+use crate::contract;
+use crate::contract::H256;
+use anyhow::{anyhow, Context};
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
 };
-
-use anyhow::{anyhow, Context};
 use tempfile::TempDir;
 use tokio::{
     process::{Child, Command},
     time::{sleep, Duration},
 };
-
-use crate::contract::{self, H256};
 
 #[derive(Debug, Clone)]
 pub struct OpenVpnCredentials {

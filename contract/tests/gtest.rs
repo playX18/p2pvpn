@@ -1,7 +1,5 @@
-use p2pvpn_contract_client::{
-    P2PvpnContractClient, P2PvpnContractClientCtors,
-};
 use p2pvpn_contract_client::p_2_pvpn_contract::P2PvpnContract;
+use p2pvpn_contract_client::{P2PvpnContractClient, P2PvpnContractClientCtors};
 use sails_rs::{client::*, gtest::*};
 
 const ACTOR_ID: u64 = 42;
@@ -28,10 +26,6 @@ async fn do_something_works() {
 
     let mut service_client = program.p_2_pvpn_contract();
 
-    let result = service_client
-        .fetch_providers()
-        .await
-        .unwrap();
-
-    assert_eq!(result, vec![]);
+    let providers = service_client.fetch_providers().await.unwrap();
+    assert_eq!(providers.len(), 5);
 }

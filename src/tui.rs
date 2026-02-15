@@ -2,24 +2,17 @@ use std::io;
 
 use crate::contract::{self, H256};
 use crate::vpn;
+use crate::vpn::{OpenVpnCredentials, OpenVpnSession};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use p2pvpn_contract_client::p_2_pvpn_contract::P2PvpnContract;
-use p2pvpn_contract_client::{P2PvpnContractClient, P2PvpnContractClientCtors};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 use tokio::task;
-
-use crate::contract::{self, H256};
-use crate::vpn::{self, OpenVpnCredentials, OpenVpnSession};
-use sails_rs::client::{GclientEnv, GearEnv};
-use sails_rs::gclient::GearApi;
-use sails_rs::CodeId;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -60,15 +53,6 @@ struct App {
 
 impl App {
     async fn new(credentials: Option<OpenVpnCredentials>) -> anyhow::Result<Self> {
-        let api = GearApi::dev().await?;
-        let client = GclientEnv::new(api);
-
-        let deployment = client
-            .deploy::<p2pvpn_contract_client::P2PvpnContractClientProgram>(CodeId::zero(), vec![])
-            .create()
-            .await?;
-        deployment.p_2_pvpn_contract().fetch_providers().await?;
-
         let provider_list = contract::fetch_providers().await;
         let mut providers = Vec::with_capacity(provider_list.len());
 
@@ -225,7 +209,7 @@ pub async fn run(credentials: Option<OpenVpnCredentials>) -> anyhow::Result<()> 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(credentials).await;
+    let mut app = App::new(credentials).await?;
 
     loop {
         terminal.draw(|f| draw(f, &app))?;
