@@ -88,7 +88,7 @@ pub async fn try_connect(
         .arg("--config")
         .arg(&staged.config_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
@@ -103,7 +103,19 @@ pub async fn try_connect(
     match child.try_wait() {
         Ok(Some(status)) => {
             contract::rank_provider(false, provider).await;
-            ConnectionAttempt::Failed(format!("openvpn exited early with status: {status}"))
+
+            // Capture stderr output from the failed process
+            let stderr = child
+                .wait_with_output()
+                .await
+                .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+                .unwrap_or_default();
+            let err_msg = if stderr.is_empty() {
+                format!("openvpn exited early with status: {status}")
+            } else {
+                format!("openvpn exited early with status: {status}\nstderr: {stderr}")
+            };
+            ConnectionAttempt::Failed(err_msg)
         }
         Ok(None) => {
             contract::rank_provider(true, provider).await;

@@ -16,3 +16,4 @@ tokio = { version = "1", features = [
     "time",
     "process",
 ] }
+ethexe-sdk = { git = "https://github.com/gear-tech/gear.git" }
