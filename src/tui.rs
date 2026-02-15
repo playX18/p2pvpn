@@ -1,17 +1,27 @@
-use std::io;
-
 use crate::contract::{self, H256};
 use crate::vpn;
 use crate::vpn::{OpenVpnCredentials, OpenVpnSession};
+use alloy::{
+    consensus::{SidecarBuilder, SimpleCoder},
+    eips::BlockNumberOrTag,
+    providers::Provider as AlloyProviderExt,
+};
+use anyhow::Context;
+use blake2::{digest::typenum::U32, Blake2b, Digest};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+use ethexe_ethereum::{abi::IRouter, TryGetReceipt};
+use gprimitives::CodeId;
+use gsigner::secp256k1::Signer;
+use gsigner::{Address, PrivateKey};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
+use std::io;
 use tokio::task;
 
 // ---------------------------------------------------------------------------
@@ -202,7 +212,7 @@ fn read_event_blocking() -> anyhow::Result<Event> {
 // Event loop
 // ---------------------------------------------------------------------------
 
-pub async fn run(credentials: Option<OpenVpnCredentials>) -> anyhow::Result<()> {
+pub async fn connect(credentials: Option<OpenVpnCredentials>) -> anyhow::Result<()> {
     // Setup terminal.
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
@@ -366,5 +376,90 @@ pub async fn run(credentials: Option<OpenVpnCredentials>) -> anyhow::Result<()> 
     // Restore terminal.
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
+    Ok(())
+}
+
+fn signer() -> anyhow::Result<Signer> {
+    let dirs = directories::ProjectDirs::from("com", "gear", "ratatui")
+        .context("failed to get project directories")?;
+    let signer = Signer::fs(dirs.data_dir().join("keys"))?;
+    Ok(signer)
+}
+
+fn code_id_for(wasm: &[u8]) -> CodeId {
+    type Blake2b256 = Blake2b<U32>;
+
+    let mut hasher = Blake2b256::new();
+    hasher.update(wasm);
+    CodeId::new(hasher.finalize().into())
+}
+
+pub async fn deploy(sender_address: Address) -> anyhow::Result<()> {
+    const RPC: &str = "wss://hoodi-reth-rpc.gear-tech.io/ws";
+
+    let router_address = "0xBC888a8B050B9B76a985d91c815d2c4f2131a58A"
+        .parse()
+        .context("failed to parse router address")?;
+
+    let signer = signer()?;
+
+    println!("Connecting to {RPC}");
+    let ethereum =
+        ethexe_ethereum::Ethereum::new(RPC, router_address, signer, sender_address).await?;
+    let provider = ethereum.provider();
+    let router = IRouter::IRouterInstance::new(router_address.into(), provider.clone());
+    let code = p2pvpn_contract::WASM_BINARY;
+    let code_id = code_id_for(code);
+
+    println!("Uploading code");
+    let chain_id = provider
+        .get_chain_id()
+        .await
+        .context("failed to fetch chain id")?;
+    let upload = router.requestCodeValidation(code_id.into_bytes().into());
+    let upload = if chain_id == 31337 {
+        upload.sidecar(SidecarBuilder::<SimpleCoder>::from_slice(code).build()?)
+    } else {
+        let base_fee_per_blob_gas = provider
+            .get_fee_history(2, BlockNumberOrTag::Latest, &[] as &[f64])
+            .await
+            .context("failed to fetch blob fee history")?
+            .base_fee_per_blob_gas
+            .last()
+            .copied()
+            .context("blob fee history is missing base blob fee")?;
+
+        upload
+            .sidecar_7594(SidecarBuilder::<SimpleCoder>::from_slice(code).build_7594()?)
+            .max_fee_per_blob_gas(base_fee_per_blob_gas.saturating_mul(3))
+    };
+    upload
+        .send()
+        .await
+        .context("failed to submit code upload transaction")?
+        .try_get_receipt_check_reverted()
+        .await
+        .context("failed to upload code")?;
+
+    let router_client = ethereum.router();
+    let res = router_client.wait_for_code_validation(code_id).await?;
+    anyhow::ensure!(res.valid, "code validation failed");
+
+    println!("Creating program from {code_id} code ID");
+    let (_, actor_id) = router_client
+        .create_program(code_id, Default::default(), None)
+        .await
+        .context("failed to create program")?;
+
+    println!("Actor ID: {actor_id}");
+
+    Ok(())
+}
+
+pub async fn import_key(private_key: PrivateKey) -> anyhow::Result<()> {
+    let signer = signer()?;
+    let public_key = signer.import(private_key)?;
+    println!("Imported key: {public_key}");
+    println!("Address: {}", public_key.to_address());
     Ok(())
 }

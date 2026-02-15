@@ -1,5 +1,6 @@
+//! Mock smart-contract types and API.
+
 #![allow(dead_code)]
-/// Mock smart-contract types and API.
 
 /// A 256-bit hash used as a unique provider key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

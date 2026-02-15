@@ -2,9 +2,9 @@ mod contract;
 mod tui;
 mod vpn;
 
-use clap::{Parser, Subcommand};
-
 use crate::vpn::OpenVpnCredentials;
+use clap::{Parser, Subcommand};
+use gsigner::{Address, PrivateKey};
 
 #[derive(Parser)]
 #[command(name = "p2pvpn", about = "Decentralised VPN client")]
@@ -24,6 +24,12 @@ enum Commands {
         #[arg(long)]
         ovpn_password: Option<String>,
     },
+    DeployContract {
+        sender_address: Address,
+    },
+    ImportKey {
+        private_key: PrivateKey,
+    },
 }
 
 #[tokio::main]
@@ -42,7 +48,13 @@ async fn main() -> anyhow::Result<()> {
                     "both --ovpn-username and --ovpn-password must be provided together"
                 ),
             };
-            tui::run(credentials).await?
+            tui::connect(credentials).await?
+        }
+        Commands::DeployContract { sender_address } => {
+            tui::deploy(sender_address).await?;
+        }
+        Commands::ImportKey { private_key } => {
+            tui::import_key(private_key).await?;
         }
     }
 

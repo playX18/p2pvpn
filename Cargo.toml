@@ -14,6 +14,7 @@ categories = ["cryptography::cryptocurrencies", "no-std", "wasm"]
 [workspace.dependencies]
 sails-rs = { version = "0.10.2", features = ["ethexe"] }
 tokio = "1.48.0"
+p2pvpn-contract = { version = "0.1.0", path = "contract" }
 p2pvpn-contract-app = { version = "0.1.0", path = "contract/app" }
 p2pvpn-contract-client = { version = "0.1.0", path = "contract/client" }
 
@@ -23,10 +24,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+alloy = "1.6.3"
 ratatui = "0.29"
 crossterm = "0.28"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+blake2 = "0.10"
 rand = "0.8"
 tempfile = "3"
 tokio = { version = "1", features = [
@@ -35,6 +38,11 @@ tokio = { version = "1", features = [
   "time",
   "process",
 ] }
+p2pvpn-contract.workspace = true
 p2pvpn-contract-client.workspace = true
 sails-rs.workspace = true
 ethexe-sdk = { git = "https://github.com/gear-tech/gear.git" }
+ethexe-ethereum = { git = "https://github.com/gear-tech/gear.git" }
+gsigner = { git = "https://github.com/gear-tech/gear.git" }
+gprimitives = { git = "https://github.com/gear-tech/gear.git" }
+directories = "6.0.0"
