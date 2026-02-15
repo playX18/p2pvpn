@@ -45,4 +45,5 @@ ethexe-sdk = { git = "https://github.com/gear-tech/gear.git" }
 ethexe-ethereum = { git = "https://github.com/gear-tech/gear.git" }
 gsigner = { git = "https://github.com/gear-tech/gear.git" }
 gprimitives = { git = "https://github.com/gear-tech/gear.git" }
+ethexe-common = { git = "https://github.com/gear-tech/gear.git" }
 directories = "6.0.0"

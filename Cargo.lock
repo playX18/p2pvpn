@@ -7992,6 +7992,7 @@ dependencies = [
  "clap",
  "crossterm",
  "directories",
+ "ethexe-common",
  "ethexe-ethereum",
  "ethexe-sdk",
  "gprimitives 1.10.0 (git+https://github.com/gear-tech/gear.git)",

@@ -39,10 +39,10 @@ enum Commands {
     },
 }
 
-const VARA_ETH_VALIDATOR: &str = "wss://vara-eth-validator-2.gear-tech.io:9944";
+const VARA_ETH_VALIDATOR: &str = "wss://vara-eth-validator-2.gear-tech.io";
 const ETH_RPC: &str = "wss://hoodi-reth-rpc.gear-tech.io/ws";
 const ROUTER_ADDRESS: &str = "0xBC888a8B050B9B76a985d91c815d2c4f2131a58A";
-const VPN_ADDRESS: &str = "0x037c5239b22fbc60905fbc6b94eb179fd6221bee";
+const VPN_ADDRESS: &str = "0x97d513e0106eae94b5fb61283b56358ced6a15f6";
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
                 Address::from_str(ROUTER_ADDRESS).with_context(|| "Invalid router address")?;
 
             let eth = Ethereum::new(ETH_RPC, router.into(), signer, sender_address.into()).await?;
-            let api = ethexe_sdk::VaraEthApi::new(ETH_RPC, eth).await?;
+            let api = ethexe_sdk::VaraEthApi::new(VARA_ETH_VALIDATOR, eth).await?;
 
             let credentials = match (ovpn_username, ovpn_password) {
                 (Some(username), Some(password)) => Some(OpenVpnCredentials { username, password }),
@@ -67,14 +67,7 @@ async fn main() -> anyhow::Result<()> {
                     "both --ovpn-username and --ovpn-password must be provided together"
                 ),
             };
-            let vpn_addr =
-                gsigner::Address::from_str(VPN_ADDRESS).with_context(|| "Invalid VPN address")?;
-            api.wrapped_vara()
-                .approve(vpn_addr.into(), 10000 * 10u128.pow(12))
-                .await?;
-            api.mirror(vpn_addr.into())
-                .executable_balance_top_up(10000 * 10u128.pow(12))
-                .await?;
+
             tui::connect(
                 api,
                 gsigner::Address::from_str(VPN_ADDRESS).with_context(|| "Invalid VPN address")?,

@@ -13,6 +13,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+
+use ethexe_common::gear::CodeState;
 use ethexe_ethereum::{abi::IRouter, TryGetReceipt};
 use ethexe_sdk::VaraEthApi;
 use gprimitives::CodeId;
@@ -51,7 +53,7 @@ enum CredentialField {
     Password,
 }
 
-struct App {
+pub struct App {
     providers: Vec<Provider>,
     selected: usize,
     phase: Phase,
@@ -62,29 +64,22 @@ struct App {
     credential_field: CredentialField,
     username_input: String,
     password_input: String,
-    api: VaraEthApi,
-    vpn_contract: Address,
+    pub api: VaraEthApi,
+    pub vpn_contract: Address,
 }
 
 impl App {
-    async fn fetch_provider_file(
+    pub async fn fetch_provider_file(
         api: &VaraEthApi,
         vpn_contract: Address,
         provider: H256,
     ) -> anyhow::Result<contract::VpnFile> {
-        let msg = p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviderFile::encode_params(
+        let prefix = stringify!(P2PvpnContract);
+        let msg = p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviderFile::encode_params_with_prefix(
+            prefix,
             provider.0,
         );
-        /*let (_, msg_id) = api
-            .mirror(vpn_contract.into())
-            .send_message(&msg, 0)
-            .await
-            .unwrap();
-        let reply = api
-            .mirror(vpn_contract.into())
-            .wait_for_reply(msg_id)
-            .await
-            .unwrap();*/
+
         let reply = api
             .mirror(vpn_contract.into())
             .calculate_reply_for_handle(&msg, 0)
@@ -98,7 +93,8 @@ impl App {
             );
         }
         let (kind, config) =
-            p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviderFile::decode_reply(
+            p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviderFile::decode_reply_with_prefix(
+                prefix,
                 &reply.payload,
             )?;
 
@@ -114,9 +110,13 @@ impl App {
         contract: Address,
         credentials: Option<OpenVpnCredentials>,
     ) -> anyhow::Result<Self> {
-        let msg = p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviders::encode_params();
-        let (_, msg_id) = api.mirror(contract.into()).send_message(&msg, 0).await?;
-        let reply = api.mirror(contract.into()).wait_for_reply(msg_id).await?;
+        //        let mut msg = stringify!(P2PvpnContract).as_bytes().to_vec();
+        let prefix = stringify!(P2PvpnContract);
+        let msg = p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviders::encode_params_with_prefix(prefix);
+        let reply = api
+            .mirror(contract.into())
+            .calculate_reply_for_handle(&msg, 0)
+            .await?;
         if !reply.code.is_success() {
             return Err(anyhow::anyhow!(
                 "failed to fetch providers: reply code {}, message: {}",
@@ -125,7 +125,8 @@ impl App {
             ));
         }
         let provider_list =
-            p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviders::decode_reply(
+            p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviders::decode_reply_with_prefix(
+                prefix,
                 &reply.payload,
             )?;
         //let provider_list = contract::fetch_providers().await;
@@ -302,7 +303,7 @@ pub async fn connect(
                         continue;
                     }
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => break,
                         KeyCode::Up | KeyCode::Char('k') => app.move_up(),
                         KeyCode::Down | KeyCode::Char('j') => app.move_down(),
                         KeyCode::Enter => {
@@ -313,9 +314,10 @@ pub async fn connect(
                                 let selected = app.selected;
                                 if app.credentials.is_none()
                                     && vpn::provider_requires_credentials(
+                                        &app,
                                         app.providers[selected].key,
                                     )
-                                    .await
+                                    .await?
                                 {
                                     app.reset_prompt_state();
                                     app.phase = Phase::PromptCredentials(selected);
@@ -399,7 +401,7 @@ pub async fn connect(
                 terminal.draw(|f| draw(f, &app))?;
 
                 let provider = &app.providers[idx];
-                match vpn::try_connect(provider.key, app.credentials.as_ref()).await {
+                match vpn::try_connect(&app, provider.key, app.credentials.as_ref()).await? {
                     vpn::ConnectionAttempt::Connected(session) => {
                         app.active_session = Some(session);
                         app.phase = Phase::Connected;
@@ -429,7 +431,10 @@ pub async fn connect(
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                    if matches!(
+                        key.code,
+                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc
+                    ) {
                         if let Some(session) = app.active_session.as_mut() {
                             let _ = session.terminate().await;
                         }
@@ -489,44 +494,55 @@ pub async fn deploy(sender_address: Address) -> anyhow::Result<()> {
     let router = IRouter::IRouterInstance::new(router_address.into(), provider.clone());
     let code = p2pvpn_contract::WASM_BINARY;
     let code_id = code_id_for(code);
-
-    println!("Uploading code");
+    println!("Uploading code: {code_id}, len={} kb", code.len() / 1024);
     let chain_id = provider
         .get_chain_id()
         .await
         .context("failed to fetch chain id")?;
-    let upload = router.requestCodeValidation(code_id.into_bytes().into());
-    let upload = if chain_id == 31337 {
-        upload.sidecar(SidecarBuilder::<SimpleCoder>::from_slice(code).build()?)
+    let state = ethereum.router().query().code_state(code_id).await?;
+    if let CodeState::Validated = state {
+        println!("Code already uploaded and validated");
+    } else if let CodeState::ValidationRequested = state {
+        println!("Code validation already requested, waiting for result...");
+        let res = ethereum.router().wait_for_code_validation(code_id).await?;
+        anyhow::ensure!(res.valid, "code validation failed");
     } else {
-        let base_fee_per_blob_gas = provider
-            .get_fee_history(2, BlockNumberOrTag::Latest, &[] as &[f64])
-            .await
-            .context("failed to fetch blob fee history")?
-            .base_fee_per_blob_gas
-            .last()
-            .copied()
-            .context("blob fee history is missing base blob fee")?;
+        println!("Code not found on-chain, uploading...");
 
+        let upload = router.requestCodeValidation(code_id.into_bytes().into());
+        let upload = if chain_id == 31337 {
+            upload.sidecar(SidecarBuilder::<SimpleCoder>::from_slice(code).build()?)
+        } else {
+            let base_fee_per_blob_gas = provider
+                .get_fee_history(2, BlockNumberOrTag::Latest, &[] as &[f64])
+                .await
+                .context("failed to fetch blob fee history")?
+                .base_fee_per_blob_gas
+                .last()
+                .copied()
+                .context("blob fee history is missing base blob fee")?;
+
+            upload
+                .sidecar_7594(SidecarBuilder::<SimpleCoder>::from_slice(code).build_7594()?)
+                .max_fee_per_blob_gas(base_fee_per_blob_gas.saturating_mul(3))
+        };
         upload
-            .sidecar_7594(SidecarBuilder::<SimpleCoder>::from_slice(code).build_7594()?)
-            .max_fee_per_blob_gas(base_fee_per_blob_gas.saturating_mul(3))
-    };
-    upload
-        .send()
-        .await
-        .context("failed to submit code upload transaction")?
-        .try_get_receipt_check_reverted()
-        .await
-        .context("failed to upload code")?;
+            .send()
+            .await
+            .context("failed to submit code upload transaction")?
+            .try_get_receipt_check_reverted()
+            .await
+            .context("failed to upload code")?;
 
+        let router_client = ethereum.router();
+        let res = router_client.wait_for_code_validation(code_id).await?;
+        anyhow::ensure!(res.valid, "code validation failed");
+    }
     let router_client = ethereum.router();
-    let res = router_client.wait_for_code_validation(code_id).await?;
-    anyhow::ensure!(res.valid, "code validation failed");
-
     println!("Creating program from {code_id} code ID");
+    let salt: [u8; 32] = rand::random();
     let (_, actor_id) = router_client
-        .create_program(code_id, Default::default(), None)
+        .create_program(code_id, salt.into(), None)
         .await
         .context("failed to create program")?;
 

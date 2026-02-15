@@ -1,8 +1,8 @@
-use crate::contract;
 use crate::contract::H256;
+use crate::{contract, tui::App};
 use anyhow::{anyhow, Context};
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -33,18 +33,30 @@ impl OpenVpnSession {
     }
 }
 
+impl Drop for OpenVpnSession {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let _ = self.child.start_kill();
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 pub enum ConnectionAttempt {
     Connected(OpenVpnSession),
     Failed(String),
 }
 
-pub async fn provider_requires_credentials(provider: H256) -> bool {
-    let file = contract::fetch_provider_file(provider).await;
+pub async fn provider_requires_credentials(app: &App, provider: H256) -> anyhow::Result<bool> {
+    let file = App::fetch_provider_file(&app.api, app.vpn_contract, provider).await?;
     match file {
-        contract::VpnFile::OpenVpn(bytes) => std::str::from_utf8(&bytes)
+        contract::VpnFile::OpenVpn(bytes) => Ok(std::str::from_utf8(&bytes)
             .map(profile_requires_credentials)
-            .unwrap_or(false),
-        contract::VpnFile::Wireguard(_) => false,
+            .unwrap_or(false)),
+        contract::VpnFile::Wireguard(_) => Ok(false),
     }
 }
 
@@ -60,10 +72,11 @@ struct StagedOpenVpnConfig {
 
 /// Attempts to connect by spawning the native openvpn client as a child process.
 pub async fn try_connect(
+    app: &App,
     provider: H256,
     credentials: Option<&OpenVpnCredentials>,
-) -> ConnectionAttempt {
-    let file = contract::fetch_provider_file(provider).await;
+) -> anyhow::Result<ConnectionAttempt> {
+    let file = App::fetch_provider_file(&app.api, app.vpn_contract, provider).await?;
 
     let staged = match file {
         contract::VpnFile::OpenVpn(bytes) => {
@@ -71,19 +84,27 @@ pub async fn try_connect(
                 Ok(staged) => staged,
                 Err(err) => {
                     contract::rank_provider(false, provider).await;
-                    return ConnectionAttempt::Failed(err.to_string());
+                    return Ok(ConnectionAttempt::Failed(err.to_string()));
                 }
             }
         }
         contract::VpnFile::Wireguard(_) => {
             contract::rank_provider(false, provider).await;
-            return ConnectionAttempt::Failed(
+            return Ok(ConnectionAttempt::Failed(
                 "selected provider only exposes WireGuard config; OpenVPN is required".into(),
-            );
+            ));
         }
     };
 
-    let mut child = match Command::new("openvpn3")
+    let openvpn_binary = match resolve_openvpn_binary() {
+        Ok(path) => path,
+        Err(err) => {
+            contract::rank_provider(false, provider).await;
+            return Ok(ConnectionAttempt::Failed(err.to_string()));
+        }
+    };
+
+    let mut child = match Command::new(&openvpn_binary)
         .arg("--config")
         .arg(&staged.config_path)
         .stdout(Stdio::null())
@@ -93,7 +114,9 @@ pub async fn try_connect(
         Ok(child) => child,
         Err(err) => {
             contract::rank_provider(false, provider).await;
-            return ConnectionAttempt::Failed(format!("failed to start openvpn: {err}"));
+            return Ok(ConnectionAttempt::Failed(format!(
+                "failed to start openvpn: {err}"
+            )));
         }
     };
 
@@ -114,18 +137,20 @@ pub async fn try_connect(
             } else {
                 format!("openvpn exited early with status: {status}\nstderr: {stderr}")
             };
-            ConnectionAttempt::Failed(err_msg)
+            Ok(ConnectionAttempt::Failed(err_msg))
         }
         Ok(None) => {
             contract::rank_provider(true, provider).await;
-            ConnectionAttempt::Connected(OpenVpnSession {
+            Ok(ConnectionAttempt::Connected(OpenVpnSession {
                 child,
                 _staging_dir: staged.staging_dir,
-            })
+            }))
         }
         Err(err) => {
             contract::rank_provider(false, provider).await;
-            ConnectionAttempt::Failed(format!("failed checking openvpn process: {err}"))
+            Ok(ConnectionAttempt::Failed(format!(
+                "failed checking openvpn process: {err}"
+            )))
         }
     }
 }
@@ -213,4 +238,65 @@ fn write_auth_file(dir: &Path, credentials: &OpenVpnCredentials) -> anyhow::Resu
     let content = format!("{}\n{}\n", credentials.username, credentials.password);
     fs::write(auth_path, content).context("failed writing OpenVPN auth file")?;
     Ok(())
+}
+
+fn resolve_openvpn_binary() -> anyhow::Result<PathBuf> {
+    if let Some(configured) = env::var_os("OPENVPN_BIN") {
+        let configured_path = PathBuf::from(configured);
+        if is_executable_file(&configured_path) {
+            return Ok(configured_path);
+        }
+
+        return Err(anyhow!(
+            "OPENVPN_BIN is set but not executable: {}",
+            configured_path.display()
+        ));
+    }
+
+    let mut searched = Vec::new();
+
+    for candidate in [
+        "/opt/homebrew/opt/openvpn/sbin/openvpn",
+        "/usr/local/opt/openvpn/sbin/openvpn",
+        "/opt/homebrew/sbin/openvpn",
+        "/usr/local/sbin/openvpn",
+        "/opt/local/sbin/openvpn",
+        "/usr/sbin/openvpn",
+        "/usr/bin/openvpn",
+    ] {
+        let path = PathBuf::from(candidate);
+        searched.push(path.display().to_string());
+        if is_executable_file(&path) {
+            return Ok(path);
+        }
+    }
+
+    if let Some(path_env) = env::var_os("PATH") {
+        for dir in env::split_paths(&path_env) {
+            let candidate = dir.join("openvpn");
+            searched.push(candidate.display().to_string());
+            if is_executable_file(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "openvpn binary not found. Install OpenVPN or set OPENVPN_BIN to the executable path. Searched: {}",
+        searched.join(", ")
+    ))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
