@@ -1,10 +1,12 @@
 mod contract;
 mod tui;
 mod vpn;
+use std::str::FromStr;
 
-use crate::vpn::OpenVpnCredentials;
+use crate::{tui::signer, vpn::OpenVpnCredentials};
 use clap::{Parser, Subcommand};
-use gsigner::{Address, PrivateKey};
+use ethexe_ethereum::{primitives::Address, Ethereum};
+use gsigner::PrivateKey;
 
 #[derive(Parser)]
 #[command(name = "p2pvpn", about = "Decentralised VPN client")]
@@ -23,15 +25,24 @@ enum Commands {
         /// OpenVPN password (used only when profile needs auth-user-pass)
         #[arg(long)]
         ovpn_password: Option<String>,
+        /// Ethereum address of user to used for ranking VPN providers (optional).
+        ///
+        /// You have to import the corresponding private key using `import-key` command for this to work.
+        #[arg(long)]
+        sender_address: Address,
     },
     DeployContract {
-        sender_address: Address,
+        sender_address: gsigner::Address,
     },
     ImportKey {
         private_key: PrivateKey,
     },
 }
 
+const VARA_ETH_VALIDATOR: &str = "wss://vara-eth-validator-2.gear-tech.io:9944";
+const ETH_RPC: &str = "wss://hoodi-reth-rpc.gear-tech.io/ws";
+const ROUTER_ADDRESS: &str = "0xBC888a8B050B9B76a985d91c815d2c4f2131a58A";
+const VPN_ADDRESS: &str = "0x000000000000000000000000037c5239b22fbc60905fbc6b94eb179fd6221bee";
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -40,7 +51,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Connect {
             ovpn_username,
             ovpn_password,
+            sender_address,
         } => {
+            let signer = signer()?;
+            let router = Address::from_str(ROUTER_ADDRESS)?;
+
+            let eth = Ethereum::new(ETH_RPC, router.into(), signer, sender_address.into()).await?;
+            let api = ethexe_sdk::VaraEthApi::new(ETH_RPC, eth).await?;
+
             let credentials = match (ovpn_username, ovpn_password) {
                 (Some(username), Some(password)) => Some(OpenVpnCredentials { username, password }),
                 (None, None) => None,
@@ -48,10 +66,10 @@ async fn main() -> anyhow::Result<()> {
                     "both --ovpn-username and --ovpn-password must be provided together"
                 ),
             };
-            tui::connect(credentials).await?
+            tui::connect(api, gsigner::Address::from_str(VPN_ADDRESS)?, credentials).await?
         }
         Commands::DeployContract { sender_address } => {
-            tui::deploy(sender_address).await?;
+            //tui::deploy(sender_address).await?;
         }
         Commands::ImportKey { private_key } => {
             tui::import_key(private_key).await?;

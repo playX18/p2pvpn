@@ -14,13 +14,15 @@ use crossterm::{
     ExecutableCommand,
 };
 use ethexe_ethereum::{abi::IRouter, TryGetReceipt};
-use gprimitives::CodeId;
+use ethexe_sdk::VaraEthApi;
+//use gprimitives::CodeId;
 use gsigner::secp256k1::Signer;
 use gsigner::{Address, PrivateKey};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
+use sails_rs::client::CallCodec;
 use std::io;
 use tokio::task;
 
@@ -59,18 +61,75 @@ struct App {
     credential_field: CredentialField,
     username_input: String,
     password_input: String,
+    api: VaraEthApi,
+    vpn_contract: Address,
 }
 
 impl App {
-    async fn new(credentials: Option<OpenVpnCredentials>) -> anyhow::Result<Self> {
-        let provider_list = contract::fetch_providers().await;
+    async fn fetch_provider_file(
+        api: &VaraEthApi,
+        vpn_contract: Address,
+        provider: H256,
+    ) -> anyhow::Result<contract::VpnFile> {
+        let msg = p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviderFile::encode_params(
+            provider.0,
+        );
+        let (_, msg_id) = api
+            .mirror(vpn_contract.into())
+            .send_message(&msg, 0)
+            .await
+            .unwrap();
+        let reply = api
+            .mirror(vpn_contract.into())
+            .wait_for_reply(msg_id)
+            .await
+            .unwrap();
+        if !reply.code.is_success() {
+            panic!(
+                "failed to fetch provider file: reply code {}, message: {}",
+                reply.code,
+                std::str::from_utf8(&reply.payload).unwrap()
+            );
+        }
+        let (kind, config) =
+            p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviderFile::decode_reply(
+                &reply.payload,
+            )?;
+
+        match kind.as_str() {
+            "openvpn" => Ok(contract::VpnFile::OpenVpn(config.as_bytes().to_vec())),
+            "wireguard" => Ok(contract::VpnFile::Wireguard(config.as_bytes().to_vec())),
+            _ => anyhow::bail!("unsupported VPN file kind: {}", kind),
+        }
+    }
+
+    async fn new(
+        api: VaraEthApi,
+        contract: Address,
+        credentials: Option<OpenVpnCredentials>,
+    ) -> anyhow::Result<Self> {
+        let msg = p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviders::encode_params();
+        let (_, msg_id) = api.mirror(contract.into()).send_message(&msg, 0).await?;
+        let reply = api.mirror(contract.into()).wait_for_reply(msg_id).await?;
+        if !reply.code.is_success() {
+            return Err(anyhow::anyhow!(
+                "failed to fetch providers: reply code {}, message: {}",
+                reply.code,
+                std::str::from_utf8(&reply.payload)?
+            ));
+        }
+        let provider_list =
+            p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviders::decode_reply(
+                &reply.payload,
+            )?;
+        //let provider_list = contract::fetch_providers().await;
         let mut providers = Vec::with_capacity(provider_list.len());
 
-        for (name, key) in provider_list {
-            let file = contract::fetch_provider_file(key).await;
+        for (key, name) in provider_list {
+            let file = Self::fetch_provider_file(&api, contract, H256(key)).await?;
             providers.push(Provider {
                 name,
-                key,
+                key: H256(key),
                 file_kind: file.kind().to_string(),
                 failed: false,
             });
@@ -87,6 +146,8 @@ impl App {
             credential_field: CredentialField::Username,
             username_input: String::new(),
             password_input: String::new(),
+            api,
+            vpn_contract: contract,
         })
     }
 
@@ -212,14 +273,18 @@ fn read_event_blocking() -> anyhow::Result<Event> {
 // Event loop
 // ---------------------------------------------------------------------------
 
-pub async fn connect(credentials: Option<OpenVpnCredentials>) -> anyhow::Result<()> {
+pub async fn connect(
+    api: VaraEthApi,
+    contract: Address,
+    credentials: Option<OpenVpnCredentials>,
+) -> anyhow::Result<()> {
     // Setup terminal.
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(credentials).await?;
+    let mut app = App::new(api, contract, credentials).await?;
 
     loop {
         terminal.draw(|f| draw(f, &app))?;
@@ -379,81 +444,11 @@ pub async fn connect(credentials: Option<OpenVpnCredentials>) -> anyhow::Result<
     Ok(())
 }
 
-fn signer() -> anyhow::Result<Signer> {
+pub fn signer() -> anyhow::Result<Signer> {
     let dirs = directories::ProjectDirs::from("com", "gear", "ratatui")
         .context("failed to get project directories")?;
     let signer = Signer::fs(dirs.data_dir().join("keys"))?;
     Ok(signer)
-}
-
-fn code_id_for(wasm: &[u8]) -> CodeId {
-    type Blake2b256 = Blake2b<U32>;
-
-    let mut hasher = Blake2b256::new();
-    hasher.update(wasm);
-    CodeId::new(hasher.finalize().into())
-}
-
-pub async fn deploy(sender_address: Address) -> anyhow::Result<()> {
-    const RPC: &str = "wss://hoodi-reth-rpc.gear-tech.io/ws";
-
-    let router_address = "0xBC888a8B050B9B76a985d91c815d2c4f2131a58A"
-        .parse()
-        .context("failed to parse router address")?;
-
-    let signer = signer()?;
-
-    println!("Connecting to {RPC}");
-    let ethereum =
-        ethexe_ethereum::Ethereum::new(RPC, router_address, signer, sender_address).await?;
-    let provider = ethereum.provider();
-    let router = IRouter::IRouterInstance::new(router_address.into(), provider.clone());
-    let code = p2pvpn_contract::WASM_BINARY;
-    let code_id = code_id_for(code);
-
-    println!("Uploading code");
-    let chain_id = provider
-        .get_chain_id()
-        .await
-        .context("failed to fetch chain id")?;
-    let upload = router.requestCodeValidation(code_id.into_bytes().into());
-    let upload = if chain_id == 31337 {
-        upload.sidecar(SidecarBuilder::<SimpleCoder>::from_slice(code).build()?)
-    } else {
-        let base_fee_per_blob_gas = provider
-            .get_fee_history(2, BlockNumberOrTag::Latest, &[] as &[f64])
-            .await
-            .context("failed to fetch blob fee history")?
-            .base_fee_per_blob_gas
-            .last()
-            .copied()
-            .context("blob fee history is missing base blob fee")?;
-
-        upload
-            .sidecar_7594(SidecarBuilder::<SimpleCoder>::from_slice(code).build_7594()?)
-            .max_fee_per_blob_gas(base_fee_per_blob_gas.saturating_mul(3))
-    };
-    upload
-        .send()
-        .await
-        .context("failed to submit code upload transaction")?
-        .try_get_receipt_check_reverted()
-        .await
-        .context("failed to upload code")?;
-
-    let router_client = ethereum.router();
-    let res = router_client.wait_for_code_validation(code_id).await?;
-    anyhow::ensure!(res.valid, "code validation failed");
-
-    println!("Creating program from {code_id} code ID");
-    let (_, actor_id) = router_client
-        .create_program(code_id, Default::default(), None)
-        .await
-        .context("failed to create program")?;
-
-    println!("Actor ID: {actor_id}");
-
-    Ok(())
 }
 
 pub async fn import_key(private_key: PrivateKey) -> anyhow::Result<()> {
