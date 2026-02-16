@@ -12,7 +12,7 @@ use alloy::{
     eips::BlockNumberOrTag,
     providers::Provider as AlloyProviderExt,
 };
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use blake2::{digest::typenum::U32, Blake2b, Digest};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -21,7 +21,9 @@ use crossterm::{
 };
 
 use ethexe_common::gear::CodeState;
-use ethexe_ethereum::{abi::IRouter, TryGetReceipt};
+use ethexe_ethereum::{
+    abi::IRouter, primitives::Address as EthereumAddress, Ethereum, TryGetReceipt,
+};
 use ethexe_sdk::VaraEthApi;
 use gprimitives::CodeId;
 //use gprimitives::CodeId;
@@ -34,6 +36,7 @@ use ratatui::{
 use sails_rs::client::CallCodec;
 use std::io;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -88,13 +91,23 @@ pub struct App {
     credentials: Option<OpenVpnCredentials>,
     credentials_from_prompt: bool,
     active_session: Option<OpenVpnSession>,
+    connected_provider: Option<(H256, String)>,
     credential_field: CredentialField,
     username_input: String,
     password_input: String,
     pub api: Arc<VaraEthApi>,
+    api_reconnect: ApiReconnectConfig,
     pub vpn_contract: Address,
     ui_tick: usize,
     phase_started_at: Instant,
+}
+
+#[derive(Clone)]
+pub struct ApiReconnectConfig {
+    pub validator_endpoint: String,
+    pub eth_rpc: String,
+    pub router_address: String,
+    pub sender_address: Address,
 }
 
 impl App {
@@ -144,6 +157,7 @@ impl App {
         api: VaraEthApi,
         contract: Address,
         credentials: Option<OpenVpnCredentials>,
+        api_reconnect: ApiReconnectConfig,
     ) -> anyhow::Result<Self> {
         //        let mut msg = stringify!(ShadowsproutContract).as_bytes().to_vec();
         let prefix = stringify!(ShadowsproutContract);
@@ -186,16 +200,24 @@ impl App {
             credentials,
             credentials_from_prompt: false,
             active_session: None,
+            connected_provider: None,
             credential_field: CredentialField::Username,
             username_input: String::new(),
             password_input: String::new(),
             api: Arc::new(api),
+            api_reconnect,
             vpn_contract: contract,
             ui_tick: 0,
             phase_started_at: Instant::now(),
         };
         app.sort_providers_by_rank();
         Ok(app)
+    }
+
+    async fn recreate_api(&mut self) -> anyhow::Result<()> {
+        let api = build_api(self.api_reconnect.clone()).await?;
+        self.api = Arc::new(api);
+        Ok(())
     }
 
     /// Transitions application phase and resets phase timer.
@@ -365,6 +387,25 @@ impl App {
     }
 }
 
+async fn build_api(config: ApiReconnectConfig) -> anyhow::Result<VaraEthApi> {
+    let signer = signer()?;
+    let router =
+        EthereumAddress::from_str(&config.router_address).context("Invalid router address")?;
+
+    let eth = Ethereum::new(
+        &config.eth_rpc,
+        router.into(),
+        signer,
+        config.sender_address,
+    )
+    .await
+    .context("failed to reconnect Ethereum API")?;
+
+    VaraEthApi::new(&config.validator_endpoint, eth)
+        .await
+        .context("failed to reconnect VaraEthApi")
+}
+
 // ---------------------------------------------------------------------------
 // UI rendering
 // ---------------------------------------------------------------------------
@@ -499,6 +540,7 @@ pub async fn connect(
     api: VaraEthApi,
     contract: Address,
     credentials: Option<OpenVpnCredentials>,
+    api_reconnect: ApiReconnectConfig,
 ) -> anyhow::Result<()> {
     // Setup terminal.
     enable_raw_mode()?;
@@ -506,7 +548,7 @@ pub async fn connect(
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(api, contract, credentials).await?;
+    let mut app = App::new(api, contract, credentials, api_reconnect).await?;
     let tick_rate = Duration::from_millis(120);
 
     loop {
@@ -692,13 +734,8 @@ pub async fn connect(
 
                 match attempt {
                     vpn::ConnectionAttempt::Connected(session) => {
-                        if let Err(err) = app.rank_provider(provider_key, true).await {
-                            app.status_msg = format!(
-                                "⚠ Connected to {}, but failed to submit rank: {err}",
-                                provider_name
-                            );
-                        }
                         app.active_session = Some(session);
+                        app.connected_provider = Some((provider_key, provider_name.clone()));
                         app.set_phase(Phase::Connected);
                         app.status_msg =
                             format!("✔ Connected to {}! Press q to disconnect.", provider_name);
@@ -718,9 +755,27 @@ pub async fn connect(
                             continue;
                         }
 
-                        if let Err(err) = app.rank_provider(provider_key, false).await {
-                            app.status_msg =
-                                format!("⚠ Failed to submit rank for {}: {err}", provider_name);
+                        let reconnect_result =
+                            match timeout(Duration::from_secs(10), app.recreate_api()).await {
+                                Ok(result) => result,
+                                Err(_) => Err(anyhow!("API reconnect timed out after 10 seconds")),
+                            };
+
+                        if let Err(err) = reconnect_result {
+                            app.status_msg = format!(
+                                "✘ Connection to {} failed: {reason}. API reconnect failed, ranking skipped: {err}",
+                                provider_name
+                            );
+                        } else if let Err(err) = app.rank_provider(provider_key, false).await {
+                            app.status_msg = format!(
+                                "✘ Connection to {} failed: {reason}. Reconnected, but failed to submit down-rank: {err}",
+                                provider_name
+                            );
+                        } else {
+                            app.status_msg = format!(
+                                "✘ Connection to {} failed: {reason}. Select another provider.",
+                                provider_name
+                            );
                         }
                         if app.credentials_from_prompt {
                             app.credentials = None;
@@ -728,10 +783,6 @@ pub async fn connect(
                             app.reset_prompt_state();
                         }
                         app.providers[idx].failed = true;
-                        app.status_msg = format!(
-                            "✘ Connection to {} failed: {reason}. Select another provider.",
-                            provider_name
-                        );
                         app.fix_selection();
                         app.set_phase(Phase::Selecting);
                     }
@@ -747,10 +798,58 @@ pub async fn connect(
                             if let Some(mut session) = app.active_session.take() {
                                 let _ = session.terminate().await;
                             }
+
+                            let reconnect_config = app.api_reconnect.clone();
+                            let reconnect_handle = tokio::spawn(async move {
+                                timeout(Duration::from_secs(15), build_api(reconnect_config)).await
+                            });
+
+                            while !reconnect_handle.is_finished() {
+                                app.tick();
+                                app.status_msg =
+                                    "Disconnected. Reconnecting API, please wait…".into();
+                                terminal.draw(|f| draw(f, &app))?;
+                                tokio::time::sleep(tick_rate).await;
+                            }
+
+                            let reconnect_result = match reconnect_handle.await {
+                                Ok(Ok(Ok(api))) => Ok(api),
+                                Ok(Ok(Err(err))) => Err(err),
+                                Ok(Err(_)) => {
+                                    Err(anyhow!("API reconnect timed out after 15 seconds"))
+                                }
+                                Err(err) => Err(anyhow!("API reconnect task failed: {err}")),
+                            };
+
+                            if let Err(err) = reconnect_result {
+                                disable_raw_mode()?;
+                                io::stdout().execute(LeaveAlternateScreen)?;
+                                println!("Disconnected, but API reconnect failed: {err}. Exiting.");
+                                std::process::exit(1);
+                            }
+
+                            if let Ok(api) = reconnect_result {
+                                app.api = Arc::new(api);
+                            }
+
                             app.set_phase(Phase::Selecting);
-                            app.status_msg =
-                                "Disconnected. Select a provider and press Enter to connect."
-                                    .into();
+                            let ranked_provider = app.connected_provider.take();
+                            app.status_msg = if let Some((provider_key, provider_name)) =
+                                ranked_provider
+                            {
+                                match app.rank_provider(provider_key, true).await {
+                                    Ok(()) => format!(
+                                        "Disconnected from {}. API reconnected and rank submitted. Select a provider and press Enter to connect.",
+                                        provider_name
+                                    ),
+                                    Err(err) => format!(
+                                        "Disconnected from {}. API reconnected, but ranking failed: {err}",
+                                        provider_name
+                                    ),
+                                }
+                            } else {
+                                "Disconnected. API reconnected. Select a provider and press Enter to connect.".into()
+                            };
                         }
                         KeyCode::Esc => break,
                         _ => {}

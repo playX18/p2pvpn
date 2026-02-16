@@ -17,12 +17,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Instant,
 };
 use tempfile::TempDir;
 use tokio::{
     process::{Child, Command},
-    time::{sleep, Duration},
+    time::{interval, sleep, Duration},
 };
 
 #[derive(Debug, Clone)]
@@ -149,18 +148,39 @@ pub async fn try_connect(
         }
     };
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if cancel_flag.load(Ordering::Relaxed) {
-            if child.try_wait()?.is_none() {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+    let mut startup_deadline = Box::pin(sleep(Duration::from_secs(16)));
+    let mut poll = interval(Duration::from_millis(100));
+
+    loop {
+        tokio::select! {
+            _ = &mut startup_deadline => break,
+            _ = poll.tick() => {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    if child.try_wait()?.is_none() {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                    }
+                    return Ok(ConnectionAttempt::Failed(
+                        "connection aborted by user".to_string(),
+                    ));
+                }
+
+                if let Some(status) = child.try_wait()? {
+                    // Capture stderr output from the failed process
+                    let stderr = child
+                        .wait_with_output()
+                        .await
+                        .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+                        .unwrap_or_default();
+                    let err_msg = if stderr.is_empty() {
+                        format!("openvpn exited early with status: {status}")
+                    } else {
+                        format!("openvpn exited early with status: {status}\\nstderr: {stderr}")
+                    };
+                    return Ok(ConnectionAttempt::Failed(err_msg));
+                }
             }
-            return Ok(ConnectionAttempt::Failed(
-                "connection aborted by user".to_string(),
-            ));
         }
-        sleep(Duration::from_millis(100)).await;
     }
 
     match child.try_wait() {
