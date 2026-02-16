@@ -83,7 +83,7 @@ const ETH_RPC: &str = "wss://hoodi-reth-rpc.gear-tech.io/ws";
 /// Default router contract address for Ethexe routing operations.
 const ROUTER_ADDRESS: &str = "0xBC888a8B050B9B76a985d91c815d2c4f2131a58A";
 /// Default deployed VPN contract address used by the `connect` flow.
-const VPN_ADDRESS: &str = "0x105e1232f8cd13e6d7211434df817b79fd621aff";
+const VPN_ADDRESS: &str = "0xecf8c8bc27e503a4ddf0fb59187fe71d543c50d9";
 
 /// Program entrypoint.
 ///
