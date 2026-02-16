@@ -1,3 +1,9 @@
+//! Terminal UI and contract operation helpers.
+//!
+//! This module hosts two groups of functionality:
+//! - interactive provider selection and connection workflow (`connect`),
+//! - command helpers for key import, contract deployment, and provider-file upload.
+
 use crate::contract::{self, H256};
 use crate::vpn;
 use crate::vpn::{OpenVpnCredentials, OpenVpnSession};
@@ -23,36 +29,57 @@ use gsigner::secp256k1::Signer;
 use gsigner::{Address, PrivateKey};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
 };
 use sails_rs::client::CallCodec;
 use std::io;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::task;
+use tokio::time::{timeout, Duration};
 
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 
 struct Provider {
+    /// Human-readable provider label.
     name: String,
+    /// Stable provider key used on-chain.
     key: H256,
+    /// Provider reputation score used for sorting.
+    rank: i32,
+    /// Human-readable VPN file type (OpenVPN/WireGuard).
     file_kind: String,
+    /// Whether the provider has failed during this UI session.
     failed: bool,
 }
 
 #[derive(Clone, Copy)]
 enum Phase {
+    /// User navigates and chooses a provider.
     Selecting,
+    /// User enters missing OpenVPN credentials.
     PromptCredentials(usize),
+    /// Connection attempt is in progress for selected index.
     Connecting(usize),
+    /// Tunnel is active.
     Connected,
 }
 
 enum CredentialField {
+    /// Username input cursor is active.
     Username,
+    /// Password input cursor is active.
     Password,
 }
 
+/// Mutable state backing the terminal UI loop.
+///
+/// It tracks provider metadata, UI phase transitions, live status text,
+/// optional credentials, active session process handle, and chain clients.
 pub struct App {
     providers: Vec<Provider>,
     selected: usize,
@@ -64,18 +91,23 @@ pub struct App {
     credential_field: CredentialField,
     username_input: String,
     password_input: String,
-    pub api: VaraEthApi,
+    pub api: Arc<VaraEthApi>,
     pub vpn_contract: Address,
+    ui_tick: usize,
+    phase_started_at: Instant,
 }
 
 impl App {
+    /// Fetches a provider configuration file by calling the VPN contract mirror.
+    ///
+    /// Converts contract wire format into [`contract::VpnFile`].
     pub async fn fetch_provider_file(
         api: &VaraEthApi,
         vpn_contract: Address,
         provider: H256,
     ) -> anyhow::Result<contract::VpnFile> {
-        let prefix = stringify!(P2PvpnContract);
-        let msg = p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviderFile::encode_params_with_prefix(
+        let prefix = stringify!(ShadowsproutContract);
+        let msg = shadowsprout_contract_client::shadowsprout_contract::io::FetchProviderFile::encode_params_with_prefix(
             prefix,
             provider.0,
         );
@@ -93,7 +125,7 @@ impl App {
             );
         }
         let (kind, config) =
-            p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviderFile::decode_reply_with_prefix(
+            shadowsprout_contract_client::shadowsprout_contract::io::FetchProviderFile::decode_reply_with_prefix(
                 prefix,
                 &reply.payload,
             )?;
@@ -105,14 +137,17 @@ impl App {
         }
     }
 
+    /// Constructs initial app state and preloads providers from the contract.
+    ///
+    /// Provider list is enriched with file kind information and sorted by rank.
     async fn new(
         api: VaraEthApi,
         contract: Address,
         credentials: Option<OpenVpnCredentials>,
     ) -> anyhow::Result<Self> {
-        //        let mut msg = stringify!(P2PvpnContract).as_bytes().to_vec();
-        let prefix = stringify!(P2PvpnContract);
-        let msg = p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviders::encode_params_with_prefix(prefix);
+        //        let mut msg = stringify!(ShadowsproutContract).as_bytes().to_vec();
+        let prefix = stringify!(ShadowsproutContract);
+        let msg = shadowsprout_contract_client::shadowsprout_contract::io::FetchProviders::encode_params_with_prefix(prefix);
         let reply = api
             .mirror(contract.into())
             .calculate_reply_for_handle(&msg, 0)
@@ -125,24 +160,25 @@ impl App {
             ));
         }
         let provider_list =
-            p2pvpn_contract_client::p_2_pvpn_contract::io::FetchProviders::decode_reply_with_prefix(
+            shadowsprout_contract_client::shadowsprout_contract::io::FetchProviders::decode_reply_with_prefix(
                 prefix,
                 &reply.payload,
             )?;
         //let provider_list = contract::fetch_providers().await;
         let mut providers = Vec::with_capacity(provider_list.len());
 
-        for (key, name) in provider_list {
+        for (key, name, rank) in provider_list {
             let file = Self::fetch_provider_file(&api, contract, H256(key)).await?;
             providers.push(Provider {
                 name,
                 key: H256(key),
+                rank,
                 file_kind: file.kind().to_string(),
                 failed: false,
             });
         }
 
-        Ok(Self {
+        let mut app = Self {
             providers,
             selected: 0,
             phase: Phase::Selecting,
@@ -153,9 +189,122 @@ impl App {
             credential_field: CredentialField::Username,
             username_input: String::new(),
             password_input: String::new(),
-            api,
+            api: Arc::new(api),
             vpn_contract: contract,
-        })
+            ui_tick: 0,
+            phase_started_at: Instant::now(),
+        };
+        app.sort_providers_by_rank();
+        Ok(app)
+    }
+
+    /// Transitions application phase and resets phase timer.
+    fn set_phase(&mut self, phase: Phase) {
+        self.phase = phase;
+        self.phase_started_at = Instant::now();
+    }
+
+    /// Advances the spinner animation frame counter.
+    fn tick(&mut self) {
+        self.ui_tick = self.ui_tick.wrapping_add(1);
+    }
+
+    /// Returns current spinner glyph for animated UI status elements.
+    fn spinner(&self) -> &'static str {
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        FRAMES[self.ui_tick % FRAMES.len()]
+    }
+
+    /// Returns display title for the current UI phase.
+    fn phase_title(&self) -> &'static str {
+        match self.phase {
+            Phase::Selecting => "Selecting Provider",
+            Phase::PromptCredentials(_) => "Credentials",
+            Phase::Connecting(_) => "Connecting",
+            Phase::Connected => "Connected",
+        }
+    }
+
+    /// Maps current phase to a coarse completion ratio for progress rendering.
+    fn phase_ratio(&self) -> f64 {
+        match self.phase {
+            Phase::Selecting => 0.12,
+            Phase::PromptCredentials(_) => 0.35,
+            Phase::Connecting(_) => {
+                let elapsed = self.phase_started_at.elapsed().as_secs_f64();
+                let fraction = (elapsed / 60.0).clamp(0.0, 1.0);
+                0.35 + fraction * 0.6
+            }
+            Phase::Connected => 1.0,
+        }
+    }
+
+    /// Returns contextual keybinding hints for the status bar.
+    fn key_hints(&self) -> &'static str {
+        match self.phase {
+            Phase::Selecting => "↑/↓ move • Enter connect • Q quit",
+            Phase::PromptCredentials(_) => "Type input • Enter continue • Esc cancel",
+            Phase::Connecting(_) => "Esc/Q abort • Negotiating tunnel…",
+            Phase::Connected => "Q disconnect • Esc quit",
+        }
+    }
+
+    /// Submits a provider ranking vote and updates local ranking cache.
+    ///
+    /// `good = true` increments provider rank; `false` decrements.
+    async fn rank_provider(&mut self, provider: H256, good: bool) -> anyhow::Result<()> {
+        let prefix = stringify!(ShadowsproutContract);
+        let msg =
+            shadowsprout_contract_client::shadowsprout_contract::io::RankProvider::encode_params_with_prefix(
+                prefix, provider.0, good,
+            );
+
+        let (_msg_id, promise) = self
+            .api
+            .mirror(self.vpn_contract.into())
+            .send_message_injected_and_watch(msg, 0)
+            .await?;
+        let reply = promise.reply;
+
+        anyhow::ensure!(
+            reply.code.is_success(),
+            "failed to rank provider: code {}, message: {}",
+            reply.code,
+            std::str::from_utf8(&reply.payload).unwrap_or("<non-utf8>")
+        );
+
+        if let Some(p) = self.providers.iter_mut().find(|p| p.key == provider) {
+            p.rank += if good { 1 } else { -1 };
+        }
+        self.sort_providers_by_rank();
+
+        Ok(())
+    }
+
+    /// Sorts providers by rank descending, then by name ascending.
+    ///
+    /// Attempts to keep the same selected provider key focused after sorting.
+    fn sort_providers_by_rank(&mut self) {
+        if self.providers.is_empty() {
+            self.selected = 0;
+            return;
+        }
+
+        let selected_key = self.providers.get(self.selected).map(|p| p.key);
+
+        self.providers
+            .sort_by(|a, b| b.rank.cmp(&a.rank).then_with(|| a.name.cmp(&b.name)));
+
+        if let Some(key) = selected_key {
+            if let Some(new_selected) = self.providers.iter().position(|p| p.key == key) {
+                self.selected = new_selected;
+                return;
+            }
+        }
+
+        if self.selected >= self.providers.len() {
+            self.selected = self.providers.len() - 1;
+        }
     }
 
     /// Move selection up, skipping failed providers.
@@ -190,16 +339,19 @@ impl App {
         self.move_down();
     }
 
+    /// Returns `true` when all currently listed providers are marked failed.
     fn all_failed(&self) -> bool {
         self.providers.iter().all(|p| p.failed)
     }
 
+    /// Clears credential prompt UI buffers and resets input field focus.
     fn reset_prompt_state(&mut self) {
         self.credential_field = CredentialField::Username;
         self.username_input.clear();
         self.password_input.clear();
     }
 
+    /// Builds current credential prompt line for status rendering.
     fn prompt_status(&self) -> String {
         match self.credential_field {
             CredentialField::Username => {
@@ -217,10 +369,20 @@ impl App {
 // UI rendering
 // ---------------------------------------------------------------------------
 
+/// Renders current application frame, including providers, progress, and status.
 fn draw(frame: &mut Frame, app: &App) {
+    let show_progress = matches!(app.phase, Phase::Connecting(_));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .constraints(if show_progress {
+            vec![
+                Constraint::Min(5),
+                Constraint::Length(3),
+                Constraint::Length(3),
+            ]
+        } else {
+            vec![Constraint::Min(5), Constraint::Length(3)]
+        })
         .split(frame.area());
 
     // -- Provider list --
@@ -229,7 +391,13 @@ fn draw(frame: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let label = format!("{} [{}] ({})", p.name, p.key.short(), p.file_kind);
+            let label = format!(
+                "{} [{}] ({}, rank: {})",
+                p.name,
+                p.key.short(),
+                p.file_kind,
+                p.rank
+            );
 
             let style = if p.failed {
                 Style::default()
@@ -253,25 +421,64 @@ fn draw(frame: &mut Frame, app: &App) {
         })
         .collect();
 
+    let provider_title = match app.phase {
+        Phase::Connecting(idx) => format!(
+            " shadowsprout – Providers  {} Connecting to {} (Esc to abort) ",
+            app.spinner(),
+            app.providers[idx].name
+        ),
+        _ => " shadowsprout – Providers ".to_string(),
+    };
+
     let list = List::new(items).block(
         Block::default()
-            .title(" p2pvpn – Providers ")
+            .title(provider_title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     );
     frame.render_widget(list, chunks[0]);
 
+    if show_progress {
+        // -- Progress bar --
+        let ratio = app.phase_ratio();
+        let percent = (ratio * 100.0).round() as u16;
+        let progress = Gauge::default()
+            .block(
+                Block::default()
+                    .title(format!(" {} ", app.phase_title()))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .gauge_style(
+                Style::default()
+                    .fg(Color::Magenta)
+                    .bg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .ratio(ratio)
+            .label(format!("{:>3}%", percent));
+        frame.render_widget(progress, chunks[1]);
+    }
+
     // -- Status bar --
-    let status = Paragraph::new(app.status_msg.as_str())
+    let status_text = format!(
+        "{} {}  │  {}",
+        app.spinner(),
+        app.status_msg,
+        app.key_hints()
+    );
+    let status = Paragraph::new(status_text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
         .style(Style::default().fg(Color::Green));
-    frame.render_widget(status, chunks[1]);
+    let status_chunk = if show_progress { chunks[2] } else { chunks[1] };
+    frame.render_widget(status, status_chunk);
 }
 
+/// Blocks until a terminal event is available and converts errors into `anyhow`.
 fn read_event_blocking() -> anyhow::Result<Event> {
     task::block_in_place(event::read).map_err(Into::into)
 }
@@ -280,6 +487,14 @@ fn read_event_blocking() -> anyhow::Result<Event> {
 // Event loop
 // ---------------------------------------------------------------------------
 
+/// Runs the interactive VPN connection TUI.
+///
+/// Behavior summary:
+/// - initializes terminal raw mode and alternate screen,
+/// - loads providers from contract,
+/// - guides selection, optional credential prompt, and connection attempts,
+/// - submits provider ranking based on outcome,
+/// - handles disconnect and clean shutdown.
 pub async fn connect(
     api: VaraEthApi,
     contract: Address,
@@ -292,13 +507,22 @@ pub async fn connect(
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(api, contract, credentials).await?;
+    let tick_rate = Duration::from_millis(120);
 
     loop {
         terminal.draw(|f| draw(f, &app))?;
 
+        let event = if event::poll(tick_rate)? {
+            Some(read_event_blocking()?)
+        } else {
+            None
+        };
+
+        app.tick();
+
         match app.phase {
             Phase::Selecting => {
-                if let Event::Key(key) = read_event_blocking()? {
+                if let Some(Event::Key(key)) = event {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
@@ -320,10 +544,10 @@ pub async fn connect(
                                     .await?
                                 {
                                     app.reset_prompt_state();
-                                    app.phase = Phase::PromptCredentials(selected);
+                                    app.set_phase(Phase::PromptCredentials(selected));
                                     app.status_msg = app.prompt_status();
                                 } else {
-                                    app.phase = Phase::Connecting(selected);
+                                    app.set_phase(Phase::Connecting(selected));
                                     app.status_msg =
                                         format!("Connecting to {}…", app.providers[selected].name);
                                 }
@@ -334,7 +558,7 @@ pub async fn connect(
                 }
             }
             Phase::PromptCredentials(idx) => {
-                if let Event::Key(key) = read_event_blocking()? {
+                if let Some(Event::Key(key)) = event {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
@@ -342,7 +566,7 @@ pub async fn connect(
                     match key.code {
                         KeyCode::Esc => {
                             app.reset_prompt_state();
-                            app.phase = Phase::Selecting;
+                            app.set_phase(Phase::Selecting);
                             app.status_msg =
                                 "Credential input cancelled. Select a provider and press Enter."
                                     .into();
@@ -376,7 +600,7 @@ pub async fn connect(
                                     });
                                     app.credentials_from_prompt = true;
                                     app.reset_prompt_state();
-                                    app.phase = Phase::Connecting(idx);
+                                    app.set_phase(Phase::Connecting(idx));
                                     app.status_msg =
                                         format!("Connecting to {}…", app.providers[idx].name);
                                 }
@@ -397,20 +621,107 @@ pub async fn connect(
                 }
             }
             Phase::Connecting(idx) => {
-                // Redraw with "connecting" status, then attempt.
-                terminal.draw(|f| draw(f, &app))?;
+                let provider_key = app.providers[idx].key;
+                let provider_name = app.providers[idx].name.clone();
+                let api = Arc::clone(&app.api);
+                let vpn_contract = app.vpn_contract;
+                let credentials = app.credentials.clone();
+                let cancel_flag = Arc::new(AtomicBool::new(false));
+                let cancel_for_task = Arc::clone(&cancel_flag);
 
-                let provider = &app.providers[idx];
-                match vpn::try_connect(&app, provider.key, app.credentials.as_ref()).await? {
+                let connect_handle = tokio::spawn(async move {
+                    timeout(
+                        Duration::from_secs(60),
+                        vpn::try_connect(
+                            api.as_ref(),
+                            vpn_contract,
+                            provider_key,
+                            credentials.as_ref(),
+                            cancel_for_task,
+                        ),
+                    )
+                    .await
+                });
+
+                let mut user_aborted = false;
+                while !connect_handle.is_finished() {
+                    app.tick();
+                    app.status_msg = format!("Connecting to {}…", provider_name);
+
+                    if event::poll(Duration::from_millis(0))? {
+                        if let Event::Key(key) = read_event_blocking()? {
+                            if key.kind == KeyEventKind::Press
+                                && matches!(
+                                    key.code,
+                                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+                                )
+                            {
+                                user_aborted = true;
+                                cancel_flag.store(true, Ordering::Relaxed);
+                                app.status_msg =
+                                    format!("Aborting connection to {}…", provider_name);
+                            }
+                        }
+                    }
+
+                    terminal.draw(|f| draw(f, &app))?;
+                    tokio::time::sleep(tick_rate).await;
+                }
+
+                let attempt = match connect_handle.await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        if err.is_cancelled() {
+                            app.status_msg = format!(
+                                "Connection to {} aborted. Select another provider.",
+                                provider_name
+                            );
+                            app.set_phase(Phase::Selecting);
+                            continue;
+                        }
+                        return Err(err.into());
+                    }
+                };
+
+                let attempt = match attempt {
+                    Ok(result) => result?,
+                    Err(_) => vpn::ConnectionAttempt::Failed(
+                        "connection timed out after 60 seconds".to_string(),
+                    ),
+                };
+
+                match attempt {
                     vpn::ConnectionAttempt::Connected(session) => {
+                        if let Err(err) = app.rank_provider(provider_key, true).await {
+                            app.status_msg = format!(
+                                "⚠ Connected to {}, but failed to submit rank: {err}",
+                                provider_name
+                            );
+                        }
                         app.active_session = Some(session);
-                        app.phase = Phase::Connected;
-                        app.status_msg = format!(
-                            "✔ Connected to {}! Press q to disconnect & quit.",
-                            app.providers[idx].name
-                        );
+                        app.set_phase(Phase::Connected);
+                        app.status_msg =
+                            format!("✔ Connected to {}! Press q to disconnect.", provider_name);
                     }
                     vpn::ConnectionAttempt::Failed(reason) => {
+                        if user_aborted || reason.contains("aborted by user") {
+                            if app.credentials_from_prompt {
+                                app.credentials = None;
+                                app.credentials_from_prompt = false;
+                                app.reset_prompt_state();
+                            }
+                            app.status_msg = format!(
+                                "Connection to {} aborted. Select a provider and press Enter.",
+                                provider_name
+                            );
+                            app.set_phase(Phase::Selecting);
+                            continue;
+                        }
+
+                        if let Err(err) = app.rank_provider(provider_key, false).await {
+                            app.status_msg =
+                                format!("⚠ Failed to submit rank for {}: {err}", provider_name);
+                        }
                         if app.credentials_from_prompt {
                             app.credentials = None;
                             app.credentials_from_prompt = false;
@@ -419,26 +730,30 @@ pub async fn connect(
                         app.providers[idx].failed = true;
                         app.status_msg = format!(
                             "✘ Connection to {} failed: {reason}. Select another provider.",
-                            app.providers[idx].name
+                            provider_name
                         );
                         app.fix_selection();
-                        app.phase = Phase::Selecting;
+                        app.set_phase(Phase::Selecting);
                     }
                 }
             }
             Phase::Connected => {
-                if let Event::Key(key) = read_event_blocking()? {
+                if let Some(Event::Key(key)) = event {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    if matches!(
-                        key.code,
-                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc
-                    ) {
-                        if let Some(session) = app.active_session.as_mut() {
-                            let _ = session.terminate().await;
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            if let Some(mut session) = app.active_session.take() {
+                                let _ = session.terminate().await;
+                            }
+                            app.set_phase(Phase::Selecting);
+                            app.status_msg =
+                                "Disconnected. Select a provider and press Enter to connect."
+                                    .into();
                         }
-                        break;
+                        KeyCode::Esc => break,
+                        _ => {}
                     }
                 }
             }
@@ -452,9 +767,10 @@ pub async fn connect(
     // Restore terminal.
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
-    Ok(())
+    std::process::exit(0);
 }
 
+/// Loads signer key storage from application-specific data directory.
 pub fn signer() -> anyhow::Result<Signer> {
     let dirs = directories::ProjectDirs::from("com", "gear", "ratatui")
         .context("failed to get project directories")?;
@@ -462,6 +778,7 @@ pub fn signer() -> anyhow::Result<Signer> {
     Ok(signer)
 }
 
+/// Imports a private key into local signer storage and prints the resulting address.
 pub async fn import_key(private_key: PrivateKey) -> anyhow::Result<()> {
     let signer = signer()?;
     let public_key = signer.import(private_key)?;
@@ -470,6 +787,7 @@ pub async fn import_key(private_key: PrivateKey) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Computes deterministic `CodeId` as BLAKE2b-256 over WASM bytes.
 fn code_id_for(wasm: &[u8]) -> CodeId {
     type Blake2b256 = Blake2b<U32>;
 
@@ -478,6 +796,10 @@ fn code_id_for(wasm: &[u8]) -> CodeId {
     CodeId::new(hasher.finalize().into())
 }
 
+/// Deploys and initializes the Shadowsprout contract program.
+///
+/// The flow validates or uploads contract code, creates a program actor,
+/// tops up execution balance, and sends the `Create` initialization message.
 pub async fn deploy(sender_address: Address) -> anyhow::Result<()> {
     const RPC: &str = "wss://hoodi-reth-rpc.gear-tech.io/ws";
 
@@ -492,7 +814,7 @@ pub async fn deploy(sender_address: Address) -> anyhow::Result<()> {
         ethexe_ethereum::Ethereum::new(RPC, router_address, signer, sender_address).await?;
     let provider = ethereum.provider();
     let router = IRouter::IRouterInstance::new(router_address.into(), provider.clone());
-    let code = p2pvpn_contract::WASM_BINARY;
+    let code = shadowsprout_contract::WASM_BINARY;
     let code_id = code_id_for(code);
     println!("Uploading code: {code_id}, len={} kb", code.len() / 1024);
     let chain_id = provider
@@ -561,7 +883,7 @@ pub async fn deploy(sender_address: Address) -> anyhow::Result<()> {
     println!("Initializing contract");
     let (_, msg_id) = ethereum
         .mirror(actor_id)
-        .send_message(p2pvpn_contract_client::io::Create::encode_params(), 0)
+        .send_message(shadowsprout_contract_client::io::Create::encode_params(), 0)
         .await?;
 
     let reply = ethereum.mirror(actor_id).wait_for_reply(msg_id).await?;
@@ -574,6 +896,93 @@ pub async fn deploy(sender_address: Address) -> anyhow::Result<()> {
     );
 
     println!("Actor ID: {actor_id}");
+
+    Ok(())
+}
+
+/// Parses 32-byte provider key from hexadecimal string with optional `0x` prefix.
+fn parse_provider_key_hex(key: &str) -> anyhow::Result<[u8; 32]> {
+    let key = key.strip_prefix("0x").unwrap_or(key);
+    anyhow::ensure!(
+        key.len() == 64,
+        "provider key must be 32-byte hex (64 chars), got {} chars",
+        key.len()
+    );
+
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let from = i * 2;
+        let to = from + 2;
+        out[i] = u8::from_str_radix(&key[from..to], 16)
+            .with_context(|| format!("invalid hex at byte {}", i))?;
+    }
+    Ok(out)
+}
+
+/// Uploads or replaces a provider VPN configuration file on-chain.
+///
+/// The file payload is submitted through `AddProviderFile` and success output
+/// indicates whether the provider entry was newly inserted or updated.
+pub async fn upload_file(
+    sender_address: gsigner::Address,
+    provider_key: String,
+    name: String,
+    kind: String,
+    file: PathBuf,
+) -> anyhow::Result<()> {
+    const RPC: &str = "wss://hoodi-reth-rpc.gear-tech.io/ws";
+    const ROUTER: &str = "0xBC888a8B050B9B76a985d91c815d2c4f2131a58A";
+    const VPN: &str = "0xb59306ae36358a0f126523fd72ea64e2c602d8ea";
+
+    let provider = parse_provider_key_hex(&provider_key)?;
+    let config = std::fs::read_to_string(&file)
+        .with_context(|| format!("failed to read file {}", file.display()))?;
+
+    let signer = signer()?;
+    let router_address = ROUTER.parse().context("failed to parse router address")?;
+    let ethereum = ethexe_ethereum::Ethereum::new(RPC, router_address, signer, sender_address)
+        .await
+        .context("failed to connect to Ethereum RPC")?;
+
+    let contract: gsigner::Address = VPN
+        .parse()
+        .context("failed to parse VPN contract address")?;
+    let prefix = stringify!(ShadowsproutContract);
+    let message =
+        shadowsprout_contract_client::shadowsprout_contract::io::AddProviderFile::encode_params_with_prefix(
+            prefix, provider, name, kind, config,
+        );
+
+    let (_, msg_id) = ethereum
+        .mirror(contract.into())
+        .send_message(message, 0)
+        .await
+        .context("failed to submit AddProviderFile message")?;
+
+    let reply = ethereum
+        .mirror(contract.into())
+        .wait_for_reply(msg_id)
+        .await
+        .context("failed while waiting for AddProviderFile reply")?;
+
+    anyhow::ensure!(
+        reply.code.is_success(),
+        "upload failed: code {}, message: {}",
+        reply.code,
+        std::str::from_utf8(&reply.payload).unwrap_or("<non-utf8>")
+    );
+
+    let inserted =
+        shadowsprout_contract_client::shadowsprout_contract::io::AddProviderFile::decode_reply_with_prefix(
+            prefix,
+            &reply.payload,
+        )?;
+
+    if inserted {
+        println!("Uploaded provider file successfully (new provider inserted)");
+    } else {
+        println!("Uploaded provider file successfully (existing provider replaced)");
+    }
 
     Ok(())
 }

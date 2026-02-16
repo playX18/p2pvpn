@@ -1,4 +1,9 @@
 //! Mock smart-contract types and API.
+//!
+//! This module provides local stand-ins for provider listing and provider-file retrieval.
+//! In production-oriented flows, the application primarily talks to on-chain contracts via
+//! generated client bindings; however, these types remain useful as a shared abstraction
+//! for UI and VPN layers.
 
 #![allow(dead_code)]
 
@@ -7,6 +12,9 @@
 pub struct H256(pub [u8; 32]);
 
 impl H256 {
+    /// Returns a compact hexadecimal preview of the provider key.
+    ///
+    /// The output keeps only the first two and last two bytes, for example `0102…1f20`.
     pub fn short(&self) -> String {
         format!(
             "{:02x}{:02x}…{:02x}{:02x}",
@@ -23,6 +31,7 @@ pub enum VpnFile {
 }
 
 impl VpnFile {
+    /// Returns a human-readable VPN kind label.
     pub fn kind(&self) -> &'static str {
         match self {
             VpnFile::Wireguard(_) => "WireGuard",
@@ -30,6 +39,7 @@ impl VpnFile {
         }
     }
 
+    /// Returns raw bytes of the provider configuration payload.
     pub fn bytes(&self) -> &[u8] {
         match self {
             VpnFile::Wireguard(b) | VpnFile::OpenVpn(b) => b,
@@ -49,23 +59,33 @@ fn mock_h256(seed: u8) -> H256 {
     H256(buf)
 }
 
-static PROVIDERS: &[(&str, u8)] = &[
-    ("NordShield", 1),
-    ("GhostRoute", 2),
-    ("ZeroTrace", 3),
-    ("NebulaNet", 4),
-    ("VaultLink", 5),
+static PROVIDERS: &[(&str, u8, i32)] = &[
+    ("NordShield", 1, 4),
+    ("GhostRoute", 2, 2),
+    ("ZeroTrace", 3, 9),
+    ("NebulaNet", 4, -1),
+    ("VaultLink", 5, 0),
 ];
 
 /// Fetch the list of available VPN providers.
-pub async fn fetch_providers() -> Vec<(String, H256)> {
+///
+/// Returns tuples of `(display_name, provider_key, rank)`.
+/// The data is deterministic and in-memory.
+pub async fn fetch_providers() -> Vec<(String, H256, i32)> {
     PROVIDERS
         .iter()
-        .map(|(name, seed)| (name.to_string(), mock_h256(*seed)))
+        .map(|(name, seed, rank)| (name.to_string(), mock_h256(*seed), *rank))
         .collect()
 }
 
 /// Fetch the VPN configuration file for a given provider.
+///
+/// Mock behavior:
+/// - even first byte => OpenVPN profile,
+/// - odd first byte => WireGuard profile.
+///
+/// Some generated OpenVPN profiles include `auth-user-pass`, which signals the
+/// caller that runtime credentials are required.
 pub async fn fetch_provider_file(provider: H256) -> VpnFile {
     if provider.0[0] % 2 == 0 {
         let requires_auth = provider.0[0] % 4 == 0;
@@ -89,6 +109,9 @@ pub async fn fetch_provider_file(provider: H256) -> VpnFile {
 }
 
 /// Rank a provider positively or negatively after a connection attempt.
+///
+/// In the mock implementation this is a no-op placeholder that models the shape
+/// of the real contract call.
 pub async fn rank_provider(good: bool, _provider: H256) {
     // In a real implementation this would call a smart-contract transaction.
     let _action = if good { "upvoted" } else { "downvoted" };

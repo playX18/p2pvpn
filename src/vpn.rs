@@ -1,3 +1,11 @@
+//! OpenVPN integration and connection attempt orchestration.
+//!
+//! This module is responsible for:
+//! - determining whether provider profiles require credentials,
+//! - staging OpenVPN config/auth files in a temporary directory,
+//! - spawning and monitoring the native `openvpn` process,
+//! - and exposing connection outcome as a typed result.
+
 use crate::contract::H256;
 use crate::{contract, tui::App};
 use anyhow::{anyhow, Context};
@@ -5,6 +13,11 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
 };
 use tempfile::TempDir;
 use tokio::{
@@ -13,17 +26,23 @@ use tokio::{
 };
 
 #[derive(Debug, Clone)]
+/// Username/password pair used for `auth-user-pass` OpenVPN profiles.
 pub struct OpenVpnCredentials {
     pub username: String,
     pub password: String,
 }
 
+/// Handle to a running OpenVPN child process and its staging directory.
+///
+/// The temporary directory must live for at least as long as the process,
+/// because OpenVPN reads the staged config and optional auth file from it.
 pub struct OpenVpnSession {
     child: Child,
     _staging_dir: TempDir,
 }
 
 impl OpenVpnSession {
+    /// Terminates the running OpenVPN process if still active.
     pub async fn terminate(&mut self) -> anyhow::Result<()> {
         if self.child.try_wait()?.is_none() {
             self.child.kill().await?;
@@ -45,11 +64,17 @@ impl Drop for OpenVpnSession {
     }
 }
 
+/// Result of a single connection attempt.
 pub enum ConnectionAttempt {
+    /// OpenVPN process survived initial health window and is considered connected.
     Connected(OpenVpnSession),
+    /// Connection setup failed with user-readable reason.
     Failed(String),
 }
 
+/// Checks whether a provider profile requires runtime credentials.
+///
+/// Only OpenVPN profiles are inspected. WireGuard profiles return `false`.
 pub async fn provider_requires_credentials(app: &App, provider: H256) -> anyhow::Result<bool> {
     let file = App::fetch_provider_file(&app.api, app.vpn_contract, provider).await?;
     match file {
@@ -60,36 +85,42 @@ pub async fn provider_requires_credentials(app: &App, provider: H256) -> anyhow:
     }
 }
 
+/// Parsed OpenVPN profile after directive rewriting.
 struct ParsedOpenVpnConfig {
+    /// Final text written to staged config file.
     rendered_config: String,
+    /// Whether `auth.txt` must be written alongside config.
     needs_auth_file: bool,
 }
 
+/// Temporary config staging output.
 struct StagedOpenVpnConfig {
+    /// Path to generated `.ovpn` file used by child process.
     config_path: PathBuf,
+    /// Temporary directory owner to keep files alive.
     staging_dir: TempDir,
 }
 
 /// Attempts to connect by spawning the native openvpn client as a child process.
 pub async fn try_connect(
-    app: &App,
+    api: &ethexe_sdk::VaraEthApi,
+    vpn_contract: gsigner::Address,
     provider: H256,
     credentials: Option<&OpenVpnCredentials>,
+    cancel_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<ConnectionAttempt> {
-    let file = App::fetch_provider_file(&app.api, app.vpn_contract, provider).await?;
+    let file = App::fetch_provider_file(api, vpn_contract, provider).await?;
 
     let staged = match file {
         contract::VpnFile::OpenVpn(bytes) => {
             match stage_openvpn_config(&bytes, credentials).context("failed to stage config") {
                 Ok(staged) => staged,
                 Err(err) => {
-                    contract::rank_provider(false, provider).await;
                     return Ok(ConnectionAttempt::Failed(err.to_string()));
                 }
             }
         }
         contract::VpnFile::Wireguard(_) => {
-            contract::rank_provider(false, provider).await;
             return Ok(ConnectionAttempt::Failed(
                 "selected provider only exposes WireGuard config; OpenVPN is required".into(),
             ));
@@ -99,7 +130,6 @@ pub async fn try_connect(
     let openvpn_binary = match resolve_openvpn_binary() {
         Ok(path) => path,
         Err(err) => {
-            contract::rank_provider(false, provider).await;
             return Ok(ConnectionAttempt::Failed(err.to_string()));
         }
     };
@@ -113,19 +143,28 @@ pub async fn try_connect(
     {
         Ok(child) => child,
         Err(err) => {
-            contract::rank_provider(false, provider).await;
             return Ok(ConnectionAttempt::Failed(format!(
                 "failed to start openvpn: {err}"
             )));
         }
     };
 
-    sleep(Duration::from_secs(2)).await;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if cancel_flag.load(Ordering::Relaxed) {
+            if child.try_wait()?.is_none() {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
+            return Ok(ConnectionAttempt::Failed(
+                "connection aborted by user".to_string(),
+            ));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 
     match child.try_wait() {
         Ok(Some(status)) => {
-            contract::rank_provider(false, provider).await;
-
             // Capture stderr output from the failed process
             let stderr = child
                 .wait_with_output()
@@ -139,22 +178,17 @@ pub async fn try_connect(
             };
             Ok(ConnectionAttempt::Failed(err_msg))
         }
-        Ok(None) => {
-            contract::rank_provider(true, provider).await;
-            Ok(ConnectionAttempt::Connected(OpenVpnSession {
-                child,
-                _staging_dir: staged.staging_dir,
-            }))
-        }
-        Err(err) => {
-            contract::rank_provider(false, provider).await;
-            Ok(ConnectionAttempt::Failed(format!(
-                "failed checking openvpn process: {err}"
-            )))
-        }
+        Ok(None) => Ok(ConnectionAttempt::Connected(OpenVpnSession {
+            child,
+            _staging_dir: staged.staging_dir,
+        })),
+        Err(err) => Ok(ConnectionAttempt::Failed(format!(
+            "failed checking openvpn process: {err}"
+        ))),
     }
 }
 
+/// Writes a temporary OpenVPN profile and optional auth file.
 fn stage_openvpn_config(
     config_bytes: &[u8],
     credentials: Option<&OpenVpnCredentials>,
@@ -163,7 +197,7 @@ fn stage_openvpn_config(
     let parsed = parse_openvpn_config(config_text, credentials)?;
 
     let staging_dir = tempfile::Builder::new()
-        .prefix("ratatui-vpn-")
+        .prefix("shadowsprout-")
         .tempdir()
         .context("failed to create temporary staging dir")?;
     let config_path = staging_dir.path().join("provider.ovpn");
@@ -180,6 +214,7 @@ fn stage_openvpn_config(
     })
 }
 
+/// Rewrites OpenVPN config to inject `auth-user-pass auth.txt` when needed.
 fn parse_openvpn_config(
     original: &str,
     credentials: Option<&OpenVpnCredentials>,
@@ -216,6 +251,7 @@ fn parse_openvpn_config(
     })
 }
 
+/// Returns whether an OpenVPN profile contains `auth-user-pass` without path argument.
 fn profile_requires_credentials(profile: &str) -> bool {
     profile.lines().any(|line| {
         let trimmed = line.trim();
@@ -226,6 +262,7 @@ fn profile_requires_credentials(profile: &str) -> bool {
     })
 }
 
+/// Returns `true` when `auth-user-pass` requires a generated credentials file.
 fn auth_user_pass_needs_generated_file(line: &str) -> bool {
     let mut parts = line.split_whitespace();
     let _directive = parts.next();
@@ -233,6 +270,7 @@ fn auth_user_pass_needs_generated_file(line: &str) -> bool {
     path_arg.is_none()
 }
 
+/// Writes OpenVPN auth credentials file expected by staged config.
 fn write_auth_file(dir: &Path, credentials: &OpenVpnCredentials) -> anyhow::Result<()> {
     let auth_path = dir.join("auth.txt");
     let content = format!("{}\n{}\n", credentials.username, credentials.password);
@@ -240,6 +278,12 @@ fn write_auth_file(dir: &Path, credentials: &OpenVpnCredentials) -> anyhow::Resu
     Ok(())
 }
 
+/// Resolves usable OpenVPN binary path.
+///
+/// Search order:
+/// 1. `OPENVPN_BIN` env var (must be executable),
+/// 2. known system paths,
+/// 3. `PATH` directories.
 fn resolve_openvpn_binary() -> anyhow::Result<PathBuf> {
     if let Some(configured) = env::var_os("OPENVPN_BIN") {
         let configured_path = PathBuf::from(configured);
@@ -288,6 +332,7 @@ fn resolve_openvpn_binary() -> anyhow::Result<PathBuf> {
 }
 
 #[cfg(unix)]
+/// Returns true when path points to a file with any execute bit set.
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
@@ -297,6 +342,7 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
+/// On non-Unix systems, executable check falls back to regular file existence.
 fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
