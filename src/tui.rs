@@ -12,7 +12,7 @@ use alloy::{
     eips::BlockNumberOrTag,
     providers::Provider as AlloyProviderExt,
 };
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use blake2::{digest::typenum::U32, Blake2b, Digest};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -215,23 +215,7 @@ impl App {
     }
 
     async fn recreate_api(&mut self) -> anyhow::Result<()> {
-        let signer = signer()?;
-        let router = EthereumAddress::from_str(&self.api_reconnect.router_address)
-            .context("Invalid router address")?;
-
-        let eth = Ethereum::new(
-            &self.api_reconnect.eth_rpc,
-            router.into(),
-            signer,
-            self.api_reconnect.sender_address,
-        )
-        .await
-        .context("failed to reconnect Ethereum API")?;
-
-        let api = VaraEthApi::new(&self.api_reconnect.validator_endpoint, eth)
-            .await
-            .context("failed to reconnect VaraEthApi")?;
-
+        let api = build_api(self.api_reconnect.clone()).await?;
         self.api = Arc::new(api);
         Ok(())
     }
@@ -401,6 +385,25 @@ impl App {
             ),
         }
     }
+}
+
+async fn build_api(config: ApiReconnectConfig) -> anyhow::Result<VaraEthApi> {
+    let signer = signer()?;
+    let router =
+        EthereumAddress::from_str(&config.router_address).context("Invalid router address")?;
+
+    let eth = Ethereum::new(
+        &config.eth_rpc,
+        router.into(),
+        signer,
+        config.sender_address,
+    )
+    .await
+    .context("failed to reconnect Ethereum API")?;
+
+    VaraEthApi::new(&config.validator_endpoint, eth)
+        .await
+        .context("failed to reconnect VaraEthApi")
 }
 
 // ---------------------------------------------------------------------------
@@ -752,15 +755,27 @@ pub async fn connect(
                             continue;
                         }
 
-                        let reconnect_result = app.recreate_api().await;
+                        let reconnect_result =
+                            match timeout(Duration::from_secs(10), app.recreate_api()).await {
+                                Ok(result) => result,
+                                Err(_) => Err(anyhow!("API reconnect timed out after 10 seconds")),
+                            };
+
                         if let Err(err) = reconnect_result {
                             app.status_msg = format!(
                                 "✘ Connection to {} failed: {reason}. API reconnect failed, ranking skipped: {err}",
                                 provider_name
                             );
                         } else if let Err(err) = app.rank_provider(provider_key, false).await {
-                            app.status_msg =
-                                format!("⚠ Failed to submit rank for {}: {err}", provider_name);
+                            app.status_msg = format!(
+                                "✘ Connection to {} failed: {reason}. Reconnected, but failed to submit down-rank: {err}",
+                                provider_name
+                            );
+                        } else {
+                            app.status_msg = format!(
+                                "✘ Connection to {} failed: {reason}. Select another provider.",
+                                provider_name
+                            );
                         }
                         if app.credentials_from_prompt {
                             app.credentials = None;
@@ -768,10 +783,6 @@ pub async fn connect(
                             app.reset_prompt_state();
                         }
                         app.providers[idx].failed = true;
-                        app.status_msg = format!(
-                            "✘ Connection to {} failed: {reason}. Select another provider.",
-                            provider_name
-                        );
                         app.fix_selection();
                         app.set_phase(Phase::Selecting);
                     }
@@ -787,12 +798,38 @@ pub async fn connect(
                             if let Some(mut session) = app.active_session.take() {
                                 let _ = session.terminate().await;
                             }
-                            let reconnect_result = app.recreate_api().await;
+
+                            let reconnect_config = app.api_reconnect.clone();
+                            let reconnect_handle = tokio::spawn(async move {
+                                timeout(Duration::from_secs(15), build_api(reconnect_config)).await
+                            });
+
+                            while !reconnect_handle.is_finished() {
+                                app.tick();
+                                app.status_msg =
+                                    "Disconnected. Reconnecting API, please wait…".into();
+                                terminal.draw(|f| draw(f, &app))?;
+                                tokio::time::sleep(tick_rate).await;
+                            }
+
+                            let reconnect_result = match reconnect_handle.await {
+                                Ok(Ok(Ok(api))) => Ok(api),
+                                Ok(Ok(Err(err))) => Err(err),
+                                Ok(Err(_)) => {
+                                    Err(anyhow!("API reconnect timed out after 15 seconds"))
+                                }
+                                Err(err) => Err(anyhow!("API reconnect task failed: {err}")),
+                            };
+
                             if let Err(err) = reconnect_result {
                                 disable_raw_mode()?;
                                 io::stdout().execute(LeaveAlternateScreen)?;
                                 println!("Disconnected, but API reconnect failed: {err}. Exiting.");
                                 std::process::exit(1);
+                            }
+
+                            if let Ok(api) = reconnect_result {
+                                app.api = Arc::new(api);
                             }
 
                             app.set_phase(Phase::Selecting);
