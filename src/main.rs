@@ -89,7 +89,7 @@ const VPN_ADDRESS: &str = "0xecf8c8bc27e503a4ddf0fb59187fe71d543c50d9";
 ///
 /// Parses CLI input, initializes required clients, validates optional credentials,
 /// and dispatches into the selected workflow.
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
