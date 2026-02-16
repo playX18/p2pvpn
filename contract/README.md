@@ -1,14 +1,14 @@
-## The **p2pvpn-contract** program
+## The **shadowsprout-contract** program
 
-[![Build Status](https://github.com/gear-tech/p2pvpn-contract/workflows/CI/badge.svg)](https://github.com/gear-tech/p2pvpn-contract/actions)
+[![Build Status](https://github.com/gear-tech/shadowsprout-contract/workflows/CI/badge.svg)](https://github.com/gear-tech/shadowsprout-contract/actions)
 
-Program **p2pvpn-contract** for [⚙️ Gear Protocol](https://github.com/gear-tech/gear) written in [⛵ Sails](https://github.com/gear-tech/sails) framework.
+Program **shadowsprout-contract** for [⚙️ Gear Protocol](https://github.com/gear-tech/gear) written in [⛵ Sails](https://github.com/gear-tech/sails) framework.
 
 The program workspace includes the following packages:
-- `p2pvpn-contract` is the package allowing to build WASM binary for the program and IDL file for it.
+- `shadowsprout-contract` is the package allowing to build WASM binary for the program and IDL file for it.
   The package also includes integration tests for the program in the `tests` sub-folder
-- `p2pvpn-contract-app` is the package containing business logic for the program represented by the `P2PvpnContract` structure.
-- `p2pvpn-contract-client` is the package containing the client for the program allowing to interact with it from another program, tests, or off-chain client.
+- `shadowsprout-contract-app` is the package containing business logic for the program represented by the `ShadowsproutContract` structure.
+- `shadowsprout-contract-client` is the package containing the client for the program allowing to interact with it from another program, tests, or off-chain client.
 
 ### 🏗️ Building
 

@@ -1,3 +1,3 @@
 fn main() {
-    sails_rs::build_client::<p2pvpn_contract_app::Program>();
+    sails_rs::build_client::<shadowsprout_contract_app::Program>();
 }

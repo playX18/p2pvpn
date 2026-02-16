@@ -2,75 +2,65 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use sails_rs::prelude::*;
 
-#[derive(Debug, Encode, Decode, TypeInfo)]
-#[codec(crate = sails_rs::scale_codec)]
-#[scale_info(crate = sails_rs::scale_info)]
-enum VpnFileKind {
-    Wireguard,
-    OpenVpn,
-}
-
-impl VpnFileKind {
-    fn into_static_str(self) -> &'static str {
-        match self {
-            VpnFileKind::Wireguard => "wireguard",
-            VpnFileKind::OpenVpn => "openvpn",
-        }
-    }
-}
-
 struct Provider {
-    name: &'static str,
-    config: &'static str,
+    name: String,
+    config: String,
+    kind: String,
     rank: i32,
 }
 
-struct P2PvpnContract {
+struct ShadowsproutContract {
     providers: BTreeMap<[u8; 32], Provider>,
 }
 
-impl P2PvpnContract {
+impl ShadowsproutContract {
     fn create() -> Self {
         let mut providers = BTreeMap::new();
         providers.insert(
             [0; 32],
             Provider {
-                name: "Japan",
-                config: include_str!("../proxies/japan.ovpn"),
+                name: "Japan".into(),
+                config: include_str!("../proxies/japan.ovpn").into(),
+                kind: "openvpn".into(),
                 rank: 1,
             },
         );
         providers.insert(
             [1; 32],
             Provider {
-                name: "Korea",
-                config: include_str!("../proxies/korea.ovpn"),
+                name: "Korea".into(),
+                config: include_str!("../proxies/korea.ovpn").into(),
+                kind: "openvpn".into(),
                 rank: 3,
             },
         );
         providers.insert(
             [2; 32],
             Provider {
-                name: "Russia",
-                config: include_str!("../proxies/russia.ovpn"),
+                name: "Russia".into(),
+                config: include_str!("../proxies/russia.ovpn").into(),
+                kind: "openvpn".into(),
                 rank: 5,
             },
         );
         providers.insert(
             [3; 32],
             Provider {
-                name: "Thailand",
-                config: include_str!("../proxies/thailand.ovpn"),
+                name: "Thailand".into(),
+                config: include_str!("../proxies/thailand.ovpn").into(),
+                kind: "openvpn".into(),
                 rank: 10,
             },
         );
         providers.insert(
             [4; 32],
             Provider {
-                name: "USA",
-                config: include_str!("../proxies/usa.ovpn"),
+                name: "USA".into(),
+                config: include_str!("../proxies/usa.ovpn").into(),
+                kind: "openvpn".into(),
                 rank: -100,
             },
         );
@@ -80,25 +70,50 @@ impl P2PvpnContract {
 }
 
 #[sails_rs::service]
-impl P2PvpnContract {
+impl ShadowsproutContract {
     /// Fetch the list of available VPN providers.
     #[export]
-    pub fn fetch_providers(&mut self) -> Vec<([u8; 32], &'static str)> {
-        self.providers.iter().map(|(k, v)| (*k, v.name)).collect()
+    pub fn fetch_providers(&mut self) -> Vec<([u8; 32], String, i32)> {
+        self.providers
+            .iter()
+            .map(|(k, v)| (*k, v.name.clone(), v.rank))
+            .collect()
     }
 
     /// Fetch the VPN configuration file for a given provider.
     #[export]
-    pub fn fetch_provider_file(&mut self, provider: [u8; 32]) -> (&'static str, &'static str) {
+    pub fn fetch_provider_file(&mut self, provider: [u8; 32]) -> (String, String) {
         let provider = self.providers.get(&provider).unwrap();
-        (VpnFileKind::OpenVpn.into_static_str(), provider.config)
+        (provider.kind.clone(), provider.config.clone())
+    }
+
+    /// Add a new VPN provider file.
+    #[export]
+    pub fn add_provider_file(
+        &mut self,
+        provider: [u8; 32],
+        name: String,
+        kind: String,
+        config: String,
+    ) -> bool {
+        self.providers
+            .insert(
+                provider,
+                Provider {
+                    name,
+                    config,
+                    kind,
+                    rank: 0,
+                },
+            )
+            .is_none()
     }
 
     /// Rank a provider positively or negatively after a connection attempt.
     #[export]
     pub fn rank_provider(&mut self, provider: [u8; 32], good: bool) {
         let provider = self.providers.get_mut(&provider).unwrap();
-        provider.rank += good as i32;
+        provider.rank += if good { 1 } else { -1 };
     }
 }
 
@@ -113,7 +128,7 @@ impl Program {
     }
 
     // Exposed service
-    pub fn p2pvpn_contract(&self) -> P2PvpnContract {
-        P2PvpnContract::create()
+    pub fn shadowsprout_contract(&self) -> ShadowsproutContract {
+        ShadowsproutContract::create()
     }
 }

@@ -2,11 +2,13 @@ constructor {
   Create : ();
 };
 
-service P2PvpnContract {
+service ShadowsproutContract {
+  /// Add a new VPN provider file.
+  AddProviderFile : (provider: [u8, 32], name: str, kind: str, config: str) -> bool;
   /// Fetch the VPN configuration file for a given provider.
   FetchProviderFile : (provider: [u8, 32]) -> struct { str, str };
   /// Fetch the list of available VPN providers.
-  FetchProviders : () -> vec struct { [u8, 32], str };
+  FetchProviders : () -> vec struct { [u8, 32], str, i32 };
   /// Rank a provider positively or negatively after a connection attempt.
   RankProvider : (provider: [u8, 32], good: bool) -> null;
 };

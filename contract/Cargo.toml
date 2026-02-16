@@ -1,5 +1,5 @@
 [package]
-name = "p2pvpn-contract"
+name = "shadowsprout-contract"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -11,15 +11,15 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-p2pvpn-contract-app.workspace = true
+shadowsprout-contract-app.workspace = true
 sails-rs.workspace = true
 
 [dev-dependencies]
-p2pvpn-contract-app.workspace = true
-p2pvpn-contract-client.workspace = true
+shadowsprout-contract-app.workspace = true
+shadowsprout-contract-client.workspace = true
 sails-rs = { workspace = true, features = ["gtest", "gclient"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 
 [build-dependencies]
-p2pvpn-contract-app.workspace = true
+shadowsprout-contract-app.workspace = true
 sails-rs = { workspace = true, features = ["build"] }

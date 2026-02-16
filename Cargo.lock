@@ -7156,31 +7156,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p2pvpn-contract"
-version = "0.1.0"
-dependencies = [
- "p2pvpn-contract-app",
- "p2pvpn-contract-client",
- "sails-rs",
- "tokio",
-]
-
-[[package]]
-name = "p2pvpn-contract-app"
-version = "0.1.0"
-dependencies = [
- "sails-rs",
-]
-
-[[package]]
-name = "p2pvpn-contract-client"
-version = "0.1.0"
-dependencies = [
- "p2pvpn-contract-app",
- "sails-rs",
-]
-
-[[package]]
 name = "page_size"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7980,30 +7955,6 @@ dependencies = [
  "unicode-segmentation",
  "unicode-truncate",
  "unicode-width 0.2.0",
-]
-
-[[package]]
-name = "ratatui-vpn"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "anyhow",
- "blake2",
- "clap",
- "crossterm",
- "directories",
- "ethexe-common",
- "ethexe-ethereum",
- "ethexe-sdk",
- "gprimitives 1.10.0 (git+https://github.com/gear-tech/gear.git)",
- "gsigner",
- "p2pvpn-contract",
- "p2pvpn-contract-client",
- "rand 0.8.5",
- "ratatui",
- "sails-rs",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -9251,6 +9202,55 @@ checksum = "b31139435f327c93c6038ed350ae4588e2c70a13d50599509fee6349967ba35a"
 dependencies = [
  "cc",
  "cfg-if",
+]
+
+[[package]]
+name = "shadowsprout"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "blake2",
+ "clap",
+ "crossterm",
+ "directories",
+ "ethexe-common",
+ "ethexe-ethereum",
+ "ethexe-sdk",
+ "gprimitives 1.10.0 (git+https://github.com/gear-tech/gear.git)",
+ "gsigner",
+ "rand 0.8.5",
+ "ratatui",
+ "sails-rs",
+ "shadowsprout-contract",
+ "shadowsprout-contract-client",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "shadowsprout-contract"
+version = "0.1.0"
+dependencies = [
+ "sails-rs",
+ "shadowsprout-contract-app",
+ "shadowsprout-contract-client",
+ "tokio",
+]
+
+[[package]]
+name = "shadowsprout-contract-app"
+version = "0.1.0"
+dependencies = [
+ "sails-rs",
+]
+
+[[package]]
+name = "shadowsprout-contract-client"
+version = "0.1.0"
+dependencies = [
+ "sails-rs",
+ "shadowsprout-contract-app",
 ]
 
 [[package]]

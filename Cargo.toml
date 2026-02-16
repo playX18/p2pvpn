@@ -14,12 +14,12 @@ categories = ["cryptography::cryptocurrencies", "no-std", "wasm"]
 [workspace.dependencies]
 sails-rs = { version = "0.10.2", features = ["ethexe"] }
 tokio = "1.48.0"
-p2pvpn-contract = { version = "0.1.0", path = "contract" }
-p2pvpn-contract-app = { version = "0.1.0", path = "contract/app" }
-p2pvpn-contract-client = { version = "0.1.0", path = "contract/client" }
+shadowsprout-contract = { version = "0.1.0", path = "contract" }
+shadowsprout-contract-app = { version = "0.1.0", path = "contract/app" }
+shadowsprout-contract-client = { version = "0.1.0", path = "contract/client" }
 
 [package]
-name = "ratatui-vpn"
+name = "shadowsprout"
 version = "0.1.0"
 edition = "2021"
 
@@ -27,7 +27,7 @@ edition = "2021"
 alloy = "1.6.3"
 ratatui = "0.29"
 crossterm = "0.28"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 blake2 = "0.10"
 rand = "0.8"
@@ -38,8 +38,8 @@ tokio = { version = "1", features = [
     "time",
     "process",
 ] }
-p2pvpn-contract.workspace = true
-p2pvpn-contract-client.workspace = true
+shadowsprout-contract.workspace = true
+shadowsprout-contract-client.workspace = true
 sails-rs.workspace = true
 ethexe-sdk = { git = "https://github.com/gear-tech/gear.git" }
 ethexe-ethereum = { git = "https://github.com/gear-tech/gear.git" }
