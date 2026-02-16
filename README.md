@@ -1,5 +1,7 @@
 # Shadowsprout (p2pvpn)
 
+[![Etherscan](https://img.shields.io/badge/Contract-0x105e1232f8cd13e6d7211434df817b79fd621aff?style=flat)](https://etherscan.io/address/0x105e1232f8cd13e6d7211434df817b79fd621aff)
+
 Shadowsprout is a Rust-based decentralized VPN client with:
 
 - a local terminal UI (Ratatui) to select and connect to VPN providers,
