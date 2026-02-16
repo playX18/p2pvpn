@@ -214,12 +214,6 @@ impl App {
         Ok(app)
     }
 
-    async fn recreate_api(&mut self) -> anyhow::Result<()> {
-        let api = build_api(self.api_reconnect.clone()).await?;
-        self.api = Arc::new(api);
-        Ok(())
-    }
-
     /// Transitions application phase and resets phase timer.
     fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;
@@ -755,27 +749,89 @@ pub async fn connect(
                             continue;
                         }
 
-                        let reconnect_result =
-                            match timeout(Duration::from_secs(10), app.recreate_api()).await {
-                                Ok(result) => result,
-                                Err(_) => Err(anyhow!("API reconnect timed out after 10 seconds")),
-                            };
+                        // Spawn API reconnection as a task so UI can remain responsive
+                        let reconnect_config = app.api_reconnect.clone();
+                        let reconnect_handle = tokio::spawn(async move {
+                            timeout(Duration::from_secs(10), build_api(reconnect_config)).await
+                        });
 
-                        if let Err(err) = reconnect_result {
+                        let mut reconnect_aborted = false;
+                        while !reconnect_handle.is_finished() {
+                            app.tick();
                             app.status_msg = format!(
-                                "✘ Connection to {} failed: {reason}. API reconnect failed, ranking skipped: {err}",
+                                "{} Reconnecting API after failed connection to {}…",
+                                app.spinner(),
                                 provider_name
                             );
-                        } else if let Err(err) = app.rank_provider(provider_key, false).await {
+
+                            if event::poll(Duration::from_millis(0))? {
+                                if let Event::Key(key) = read_event_blocking()? {
+                                    if key.kind == KeyEventKind::Press
+                                        && matches!(
+                                            key.code,
+                                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+                                        )
+                                    {
+                                        reconnect_aborted = true;
+                                        app.status_msg = "Aborting reconnection…".into();
+                                    }
+                                }
+                            }
+
+                            terminal.draw(|f| draw(f, &app))?;
+                            tokio::time::sleep(tick_rate).await;
+
+                            if reconnect_aborted {
+                                break;
+                            }
+                        }
+
+                        let reconnect_result = match reconnect_handle.await {
+                            Ok(Ok(Ok(api))) => Ok(api),
+                            Ok(Ok(Err(err))) => Err(err),
+                            Ok(Err(_)) => {
+                                Err(anyhow!("API reconnect timed out after 10 seconds"))
+                            }
+                            Err(err) => Err(anyhow!("API reconnect task failed: {err}")),
+                        };
+
+                        if reconnect_aborted {
+                            if app.credentials_from_prompt {
+                                app.credentials = None;
+                                app.credentials_from_prompt = false;
+                                app.reset_prompt_state();
+                            }
                             app.status_msg = format!(
-                                "✘ Connection to {} failed: {reason}. Reconnected, but failed to submit down-rank: {err}",
-                                provider_name
+                                "Reconnection aborted. Connection to {} failed: {}. Select another provider.",
+                                provider_name, reason
                             );
-                        } else {
-                            app.status_msg = format!(
-                                "✘ Connection to {} failed: {reason}. Select another provider.",
-                                provider_name
-                            );
+                            app.providers[idx].failed = true;
+                            app.fix_selection();
+                            app.set_phase(Phase::Selecting);
+                            continue;
+                        }
+
+                        match reconnect_result {
+                            Ok(api) => {
+                                app.api = Arc::new(api);
+                                if let Err(err) = app.rank_provider(provider_key, false).await {
+                                    app.status_msg = format!(
+                                        "✘ Connection to {} failed: {reason}. Reconnected, but failed to submit down-rank: {err}",
+                                        provider_name
+                                    );
+                                } else {
+                                    app.status_msg = format!(
+                                        "✘ Connection to {} failed: {reason}. Select another provider.",
+                                        provider_name
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                app.status_msg = format!(
+                                    "✘ Connection to {} failed: {reason}. API reconnect failed, ranking skipped: {err}",
+                                    provider_name
+                                );
+                            }
                         }
                         if app.credentials_from_prompt {
                             app.credentials = None;
