@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Terminal UI and contract operation helpers.
 //!
 //! This module hosts two groups of functionality:
@@ -12,7 +13,7 @@ use alloy::{
     eips::BlockNumberOrTag,
     providers::Provider as AlloyProviderExt,
 };
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use blake2::{digest::typenum::U32, Blake2b, Digest};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -37,11 +38,73 @@ use sails_rs::client::CallCodec;
 use std::io;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::mpsc;
 use tokio::task;
 use tokio::time::{timeout, Duration};
+
+// ---------------------------------------------------------------------------
+// Channel message types for background task communication
+// ---------------------------------------------------------------------------
+
+/// Tasks that the main UI thread sends to the background worker.
+enum TaskRequest {
+    /// Connect to a VPN provider.
+    Connect {
+        provider_key: H256,
+        provider_name: String,
+        credentials: Option<OpenVpnCredentials>,
+    },
+    /// Disconnect active VPN session, reconnect API, and rank provider.
+    Disconnect {
+        session: OpenVpnSession,
+        provider_key: H256,
+        provider_name: String,
+    },
+    /// Rank a provider on-chain.
+    RankProvider { provider: H256, good: bool },
+    /// Terminate the background worker.
+    Shutdown,
+}
+
+/// Responses that the background worker sends back to the main UI thread.
+enum TaskResponse {
+    /// VPN connection succeeded.
+    Connected {
+        session: OpenVpnSession,
+        provider_key: H256,
+        provider_name: String,
+    },
+    /// VPN connection failed.
+    ConnectionFailed { provider_key: H256, reason: String },
+    /// API reconnection completed in background worker.
+    ApiReconnected { api: Arc<VaraEthApi> },
+    /// Disconnect and cleanup completed.
+    Disconnected {
+        provider_key: H256,
+        provider_name: String,
+        rank_success: bool,
+    },
+    /// Provider ranking completed.
+    ProviderRanked {
+        provider: H256,
+        good: bool,
+        new_rank: i32,
+    },
+    /// Background task encountered an error.
+    Error(String),
+}
+
+/// Tracks pending operations for UI display.
+#[derive(Clone, Debug)]
+enum PendingOperation {
+    /// Connecting to a provider.
+    Connecting { provider_name: String },
+    /// Disconnecting from a provider.
+    Disconnecting { provider_name: String },
+}
 
 // ---------------------------------------------------------------------------
 // App state
@@ -100,6 +163,12 @@ pub struct App {
     pub vpn_contract: Address,
     ui_tick: usize,
     phase_started_at: Instant,
+    /// Channel for sending tasks to the background worker.
+    task_sender: mpsc::Sender<TaskRequest>,
+    /// Channel for receiving responses from the background worker.
+    response_receiver: mpsc::Receiver<TaskResponse>,
+    /// Current pending operation for UI display.
+    pending_operation: Option<PendingOperation>,
 }
 
 #[derive(Clone)]
@@ -154,10 +223,12 @@ impl App {
     ///
     /// Provider list is enriched with file kind information and sorted by rank.
     async fn new(
-        api: VaraEthApi,
+        api: Arc<VaraEthApi>,
         contract: Address,
         credentials: Option<OpenVpnCredentials>,
         api_reconnect: ApiReconnectConfig,
+        task_sender: mpsc::Sender<TaskRequest>,
+        response_receiver: mpsc::Receiver<TaskResponse>,
     ) -> anyhow::Result<Self> {
         //        let mut msg = stringify!(ShadowsproutContract).as_bytes().to_vec();
         let prefix = stringify!(ShadowsproutContract);
@@ -204,11 +275,14 @@ impl App {
             credential_field: CredentialField::Username,
             username_input: String::new(),
             password_input: String::new(),
-            api: Arc::new(api),
+            api,
             api_reconnect,
             vpn_contract: contract,
             ui_tick: 0,
             phase_started_at: Instant::now(),
+            task_sender,
+            response_receiver,
+            pending_operation: None,
         };
         app.sort_providers_by_rank();
         Ok(app)
@@ -401,6 +475,189 @@ async fn build_api(config: ApiReconnectConfig) -> anyhow::Result<VaraEthApi> {
 }
 
 // ---------------------------------------------------------------------------
+// Background task worker
+// ---------------------------------------------------------------------------
+
+/// Background worker that processes tasks from the main UI thread.
+async fn background_worker(
+    mut task_receiver: mpsc::Receiver<TaskRequest>,
+    response_sender: mpsc::Sender<TaskResponse>,
+    api: Arc<VaraEthApi>,
+    vpn_contract: Address,
+    reconnect_config: ApiReconnectConfig,
+) {
+    let mut api = api;
+
+    while let Some(task) = task_receiver.recv().await {
+        match task {
+            TaskRequest::Connect {
+                provider_key,
+                provider_name,
+                credentials,
+            } => {
+                let cancel_flag = Arc::new(AtomicBool::new(false));
+                let cancel_for_task = Arc::clone(&cancel_flag);
+
+                let result = timeout(
+                    Duration::from_secs(60),
+                    vpn::try_connect(
+                        api.as_ref(),
+                        vpn_contract,
+                        provider_key,
+                        credentials.as_ref(),
+                        cancel_for_task,
+                    ),
+                )
+                .await;
+
+                match result {
+                    Ok(Ok(vpn::ConnectionAttempt::Connected(session))) => {
+                        let _ = response_sender
+                            .send(TaskResponse::Connected {
+                                session,
+                                provider_key,
+                                provider_name,
+                            })
+                            .await;
+                    }
+                    Ok(Ok(vpn::ConnectionAttempt::Failed(reason))) => {
+                        // Auto-reconnect API on failure
+                        if let Ok(new_api) = build_api(reconnect_config.clone()).await {
+                            api = Arc::new(new_api);
+                            let _ = response_sender
+                                .send(TaskResponse::ApiReconnected {
+                                    api: Arc::clone(&api),
+                                })
+                                .await;
+                        }
+                        let _ = response_sender
+                            .send(TaskResponse::ConnectionFailed {
+                                provider_key,
+                                reason,
+                            })
+                            .await;
+                    }
+                    Ok(Err(e)) => {
+                        // Auto-reconnect API on error
+                        if let Ok(new_api) = build_api(reconnect_config.clone()).await {
+                            api = Arc::new(new_api);
+                            let _ = response_sender
+                                .send(TaskResponse::ApiReconnected {
+                                    api: Arc::clone(&api),
+                                })
+                                .await;
+                        }
+                        let _ = response_sender
+                            .send(TaskResponse::ConnectionFailed {
+                                provider_key,
+                                reason: e.to_string(),
+                            })
+                            .await;
+                    }
+                    Err(_) => {
+                        // Timeout - auto-reconnect API
+                        if let Ok(new_api) = build_api(reconnect_config.clone()).await {
+                            api = Arc::new(new_api);
+                            let _ = response_sender
+                                .send(TaskResponse::ApiReconnected {
+                                    api: Arc::clone(&api),
+                                })
+                                .await;
+                        }
+                        let _ = response_sender
+                            .send(TaskResponse::ConnectionFailed {
+                                provider_key,
+                                reason: "connection timed out after 60 seconds".to_string(),
+                            })
+                            .await;
+                    }
+                }
+            }
+            TaskRequest::Disconnect {
+                mut session,
+                provider_key,
+                provider_name,
+            } => {
+                // Terminate the VPN session
+                let _ = session.terminate().await;
+
+                // Reconnect API
+                if let Ok(new_api) = build_api(reconnect_config.clone()).await {
+                    api = Arc::new(new_api);
+                    let _ = response_sender
+                        .send(TaskResponse::ApiReconnected {
+                            api: Arc::clone(&api),
+                        })
+                        .await;
+                }
+
+                // Rank provider (good = true for successful disconnect)
+                let rank_success = rank_provider_internal(&api, vpn_contract, provider_key, true)
+                    .await
+                    .is_ok();
+
+                let _ = response_sender
+                    .send(TaskResponse::Disconnected {
+                        provider_key,
+                        provider_name,
+                        rank_success,
+                    })
+                    .await;
+            }
+            TaskRequest::RankProvider { provider, good } => {
+                let result = rank_provider_internal(&api, vpn_contract, provider, good).await;
+                let new_rank = if result.is_ok() {
+                    if good {
+                        1
+                    } else {
+                        -1
+                    }
+                } else {
+                    0
+                };
+                let _ = response_sender
+                    .send(TaskResponse::ProviderRanked {
+                        provider,
+                        good,
+                        new_rank,
+                    })
+                    .await;
+            }
+            TaskRequest::Shutdown => break,
+        }
+    }
+}
+
+/// Internal helper to rank a provider on-chain.
+async fn rank_provider_internal(
+    api: &VaraEthApi,
+    vpn_contract: Address,
+    provider: H256,
+    good: bool,
+) -> anyhow::Result<()> {
+    let prefix = stringify!(ShadowsproutContract);
+    let msg =
+        shadowsprout_contract_client::shadowsprout_contract::io::RankProvider::encode_params_with_prefix(
+            prefix, provider.0, good,
+        );
+
+    let (_msg_id, promise) = api
+        .mirror(vpn_contract.into())
+        .send_message_injected_and_watch(msg, 0)
+        .await?;
+    let reply = promise.reply;
+
+    anyhow::ensure!(
+        reply.code.is_success(),
+        "failed to rank provider: code {}, message: {}",
+        reply.code,
+        std::str::from_utf8(&reply.payload).unwrap_or("<non-utf8>")
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // UI rendering
 // ---------------------------------------------------------------------------
 
@@ -496,9 +753,21 @@ fn draw(frame: &mut Frame, app: &App) {
     }
 
     // -- Status bar --
+    let status_prefix = if matches!(
+        app.pending_operation,
+        Some(PendingOperation::Connecting { .. })
+    ) || matches!(
+        app.pending_operation,
+        Some(PendingOperation::Disconnecting { .. })
+    ) || matches!(app.phase, Phase::Connecting(_))
+    {
+        format!("{} ", app.spinner())
+    } else {
+        String::new()
+    };
     let status_text = format!(
-        "{} {}  │  {}",
-        app.spinner(),
+        "{}{}  │  {}",
+        status_prefix,
         app.status_msg,
         app.key_hints()
     );
@@ -542,7 +811,33 @@ pub async fn connect(
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(api, contract, credentials, api_reconnect).await?;
+    // Create channels for background task communication
+    let (task_sender, task_receiver) = mpsc::channel::<TaskRequest>(8);
+    let (response_sender, response_receiver) = mpsc::channel::<TaskResponse>(8);
+
+    // Wrap API in Arc for sharing
+    let api = Arc::new(api);
+
+    // Spawn background worker
+    let worker_api_reconnect = api_reconnect.clone();
+    let worker_api = Arc::clone(&api);
+    tokio::spawn(background_worker(
+        task_receiver,
+        response_sender,
+        worker_api,
+        contract,
+        worker_api_reconnect,
+    ));
+
+    let mut app = App::new(
+        api,
+        contract,
+        credentials,
+        api_reconnect,
+        task_sender,
+        response_receiver,
+    )
+    .await?;
     let tick_rate = Duration::from_millis(120);
 
     loop {
@@ -555,6 +850,11 @@ pub async fn connect(
         };
 
         app.tick();
+
+        // Process any responses from background worker
+        while let Ok(response) = app.response_receiver.try_recv() {
+            handle_background_response(&mut app, response);
+        }
 
         match app.phase {
             Phase::Selecting => {
@@ -583,9 +883,25 @@ pub async fn connect(
                                     app.set_phase(Phase::PromptCredentials(selected));
                                     app.status_msg = app.prompt_status();
                                 } else {
+                                    // Send connect task to background worker
+                                    let provider_key = app.providers[selected].key;
+                                    let provider_name = app.providers[selected].name.clone();
+                                    let creds = app.credentials.clone();
+
+                                    app.pending_operation = Some(PendingOperation::Connecting {
+                                        provider_name: provider_name.clone(),
+                                    });
                                     app.set_phase(Phase::Connecting(selected));
-                                    app.status_msg =
-                                        format!("Connecting to {}…", app.providers[selected].name);
+                                    app.status_msg = format!("Connecting to {}…", provider_name);
+
+                                    let _ = app
+                                        .task_sender
+                                        .send(TaskRequest::Connect {
+                                            provider_key,
+                                            provider_name,
+                                            credentials: creds,
+                                        })
+                                        .await;
                                 }
                             }
                         }
@@ -636,9 +952,26 @@ pub async fn connect(
                                     });
                                     app.credentials_from_prompt = true;
                                     app.reset_prompt_state();
+
+                                    // Send connect task to background worker
+                                    let provider_key = app.providers[idx].key;
+                                    let provider_name = app.providers[idx].name.clone();
+                                    let creds = app.credentials.clone();
+
+                                    app.pending_operation = Some(PendingOperation::Connecting {
+                                        provider_name: provider_name.clone(),
+                                    });
                                     app.set_phase(Phase::Connecting(idx));
-                                    app.status_msg =
-                                        format!("Connecting to {}…", app.providers[idx].name);
+                                    app.status_msg = format!("Connecting to {}…", provider_name);
+
+                                    let _ = app
+                                        .task_sender
+                                        .send(TaskRequest::Connect {
+                                            provider_key,
+                                            provider_name,
+                                            credentials: creds,
+                                        })
+                                        .await;
                                 }
                             }
                         },
@@ -656,192 +989,33 @@ pub async fn connect(
                     }
                 }
             }
-            Phase::Connecting(idx) => {
-                let provider_key = app.providers[idx].key;
-                let provider_name = app.providers[idx].name.clone();
-                let api = Arc::clone(&app.api);
-                let vpn_contract = app.vpn_contract;
-                let credentials = app.credentials.clone();
-                let cancel_flag = Arc::new(AtomicBool::new(false));
-                let cancel_for_task = Arc::clone(&cancel_flag);
-
-                let connect_handle = tokio::spawn(async move {
-                    timeout(
-                        Duration::from_secs(60),
-                        vpn::try_connect(
-                            api.as_ref(),
-                            vpn_contract,
-                            provider_key,
-                            credentials.as_ref(),
-                            cancel_for_task,
-                        ),
-                    )
-                    .await
-                });
-
-                let mut user_aborted = false;
-                while !connect_handle.is_finished() {
-                    app.tick();
-                    app.status_msg = format!("Connecting to {}…", provider_name);
-
-                    if event::poll(Duration::from_millis(0))? {
-                        if let Event::Key(key) = read_event_blocking()? {
-                            if key.kind == KeyEventKind::Press
-                                && matches!(
-                                    key.code,
-                                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
-                                )
-                            {
-                                user_aborted = true;
-                                cancel_flag.store(true, Ordering::Relaxed);
-                                app.status_msg =
-                                    format!("Aborting connection to {}…", provider_name);
-                            }
-                        }
-                    }
-
-                    terminal.draw(|f| draw(f, &app))?;
-                    tokio::time::sleep(tick_rate).await;
-                }
-
-                let attempt = match connect_handle.await {
-                    Ok(value) => value,
-                    Err(err) => {
-                        if err.is_cancelled() {
-                            app.status_msg = format!(
-                                "Connection to {} aborted. Select another provider.",
-                                provider_name
-                            );
-                            app.set_phase(Phase::Selecting);
-                            continue;
-                        }
-                        return Err(err.into());
-                    }
-                };
-
-                let attempt = match attempt {
-                    Ok(result) => result?,
-                    Err(_) => vpn::ConnectionAttempt::Failed(
-                        "connection timed out after 60 seconds".to_string(),
-                    ),
-                };
-
-                match attempt {
-                    vpn::ConnectionAttempt::Connected(session) => {
-                        app.active_session = Some(session);
-                        app.connected_provider = Some((provider_key, provider_name.clone()));
-                        app.set_phase(Phase::Connected);
-                        app.status_msg =
-                            format!("✔ Connected to {}! Press q to disconnect.", provider_name);
-                    }
-                    vpn::ConnectionAttempt::Failed(reason) => {
-                        if user_aborted || reason.contains("aborted by user") {
-                            if app.credentials_from_prompt {
-                                app.credentials = None;
-                                app.credentials_from_prompt = false;
-                                app.reset_prompt_state();
-                            }
-                            app.status_msg = format!(
-                                "Connection to {} aborted. Select a provider and press Enter.",
-                                provider_name
-                            );
-                            app.set_phase(Phase::Selecting);
-                            continue;
-                        }
-
-                        // Spawn API reconnection as a task so UI can remain responsive
-                        let reconnect_config = app.api_reconnect.clone();
-                        let reconnect_handle = tokio::spawn(async move {
-                            timeout(Duration::from_secs(10), build_api(reconnect_config)).await
-                        });
-
-                        let mut reconnect_aborted = false;
-                        while !reconnect_handle.is_finished() {
-                            app.tick();
-                            app.status_msg = format!(
-                                "{} Reconnecting API after failed connection to {}…",
-                                app.spinner(),
-                                provider_name
-                            );
-
-                            if event::poll(Duration::from_millis(0))? {
-                                if let Event::Key(key) = read_event_blocking()? {
-                                    if key.kind == KeyEventKind::Press
-                                        && matches!(
-                                            key.code,
-                                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
-                                        )
-                                    {
-                                        reconnect_aborted = true;
-                                        app.status_msg = "Aborting reconnection…".into();
-                                    }
-                                }
-                            }
-
-                            terminal.draw(|f| draw(f, &app))?;
-                            tokio::time::sleep(tick_rate).await;
-
-                            if reconnect_aborted {
-                                break;
-                            }
-                        }
-
-                        let reconnect_result = match reconnect_handle.await {
-                            Ok(Ok(Ok(api))) => Ok(api),
-                            Ok(Ok(Err(err))) => Err(err),
-                            Ok(Err(_)) => {
-                                Err(anyhow!("API reconnect timed out after 10 seconds"))
-                            }
-                            Err(err) => Err(anyhow!("API reconnect task failed: {err}")),
-                        };
-
-                        if reconnect_aborted {
-                            if app.credentials_from_prompt {
-                                app.credentials = None;
-                                app.credentials_from_prompt = false;
-                                app.reset_prompt_state();
-                            }
-                            app.status_msg = format!(
-                                "Reconnection aborted. Connection to {} failed: {}. Select another provider.",
-                                provider_name, reason
-                            );
-                            app.providers[idx].failed = true;
-                            app.fix_selection();
-                            app.set_phase(Phase::Selecting);
-                            continue;
-                        }
-
-                        match reconnect_result {
-                            Ok(api) => {
-                                app.api = Arc::new(api);
-                                if let Err(err) = app.rank_provider(provider_key, false).await {
-                                    app.status_msg = format!(
-                                        "✘ Connection to {} failed: {reason}. Reconnected, but failed to submit down-rank: {err}",
-                                        provider_name
-                                    );
-                                } else {
-                                    app.status_msg = format!(
-                                        "✘ Connection to {} failed: {reason}. Select another provider.",
-                                        provider_name
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                app.status_msg = format!(
-                                    "✘ Connection to {} failed: {reason}. API reconnect failed, ranking skipped: {err}",
-                                    provider_name
-                                );
-                            }
-                        }
+            Phase::Connecting(_idx) => {
+                // Connection is handled by background worker
+                // Just handle user input for abort
+                if let Some(Event::Key(key)) = event {
+                    if key.kind == KeyEventKind::Press
+                        && matches!(
+                            key.code,
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+                        )
+                    {
+                        // User wants to abort - just go back to selecting
+                        app.pending_operation = None;
                         if app.credentials_from_prompt {
                             app.credentials = None;
                             app.credentials_from_prompt = false;
                             app.reset_prompt_state();
                         }
-                        app.providers[idx].failed = true;
-                        app.fix_selection();
+                        app.status_msg =
+                            "Connection cancelled. Select a provider and press Enter.".into();
                         app.set_phase(Phase::Selecting);
                     }
+                }
+
+                // Update status message based on pending operation
+                if let Some(PendingOperation::Connecting { provider_name }) = &app.pending_operation
+                {
+                    app.status_msg = format!("Connecting to {}…", provider_name);
                 }
             }
             Phase::Connected => {
@@ -851,61 +1025,28 @@ pub async fn connect(
                     }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') => {
-                            if let Some(mut session) = app.active_session.take() {
-                                let _ = session.terminate().await;
-                            }
+                            // Send disconnect task to background worker
+                            if let Some(session) = app.active_session.take() {
+                                if let Some((provider_key, provider_name)) =
+                                    app.connected_provider.take()
+                                {
+                                    app.pending_operation = Some(PendingOperation::Disconnecting {
+                                        provider_name: provider_name.clone(),
+                                    });
+                                    app.status_msg =
+                                        format!("Disconnecting from {}…", provider_name);
 
-                            let reconnect_config = app.api_reconnect.clone();
-                            let reconnect_handle = tokio::spawn(async move {
-                                timeout(Duration::from_secs(15), build_api(reconnect_config)).await
-                            });
-
-                            while !reconnect_handle.is_finished() {
-                                app.tick();
-                                app.status_msg =
-                                    "Disconnected. Reconnecting API, please wait…".into();
-                                terminal.draw(|f| draw(f, &app))?;
-                                tokio::time::sleep(tick_rate).await;
-                            }
-
-                            let reconnect_result = match reconnect_handle.await {
-                                Ok(Ok(Ok(api))) => Ok(api),
-                                Ok(Ok(Err(err))) => Err(err),
-                                Ok(Err(_)) => {
-                                    Err(anyhow!("API reconnect timed out after 15 seconds"))
+                                    let _ = app
+                                        .task_sender
+                                        .send(TaskRequest::Disconnect {
+                                            session,
+                                            provider_key,
+                                            provider_name,
+                                        })
+                                        .await;
                                 }
-                                Err(err) => Err(anyhow!("API reconnect task failed: {err}")),
-                            };
-
-                            if let Err(err) = reconnect_result {
-                                disable_raw_mode()?;
-                                io::stdout().execute(LeaveAlternateScreen)?;
-                                println!("Disconnected, but API reconnect failed: {err}. Exiting.");
-                                std::process::exit(1);
                             }
-
-                            if let Ok(api) = reconnect_result {
-                                app.api = Arc::new(api);
-                            }
-
                             app.set_phase(Phase::Selecting);
-                            let ranked_provider = app.connected_provider.take();
-                            app.status_msg = if let Some((provider_key, provider_name)) =
-                                ranked_provider
-                            {
-                                match app.rank_provider(provider_key, true).await {
-                                    Ok(()) => format!(
-                                        "Disconnected from {}. API reconnected and rank submitted. Select a provider and press Enter to connect.",
-                                        provider_name
-                                    ),
-                                    Err(err) => format!(
-                                        "Disconnected from {}. API reconnected, but ranking failed: {err}",
-                                        provider_name
-                                    ),
-                                }
-                            } else {
-                                "Disconnected. API reconnected. Select a provider and press Enter to connect.".into()
-                            };
                         }
                         KeyCode::Esc => break,
                         _ => {}
@@ -915,6 +1056,9 @@ pub async fn connect(
         }
     }
 
+    // Send shutdown signal to background worker
+    let _ = app.task_sender.send(TaskRequest::Shutdown).await;
+
     if let Some(session) = app.active_session.as_mut() {
         let _ = session.terminate().await;
     }
@@ -923,6 +1067,99 @@ pub async fn connect(
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     std::process::exit(0);
+}
+
+/// Handle responses from the background worker.
+fn handle_background_response(app: &mut App, response: TaskResponse) {
+    match response {
+        TaskResponse::Connected {
+            session,
+            provider_key,
+            provider_name,
+        } => {
+            app.active_session = Some(session);
+            app.connected_provider = Some((provider_key, provider_name.clone()));
+            app.pending_operation = None;
+            app.set_phase(Phase::Connected);
+            app.status_msg = format!("✔ Connected to {}! Press q to disconnect.", provider_name);
+        }
+        TaskResponse::ConnectionFailed {
+            provider_key,
+            reason,
+        } => {
+            app.pending_operation = None;
+
+            // Find the provider index
+            if let Some(idx) = app.providers.iter().position(|p| p.key == provider_key) {
+                app.providers[idx].failed = true;
+                app.fix_selection();
+            }
+
+            if app.credentials_from_prompt {
+                app.credentials = None;
+                app.credentials_from_prompt = false;
+                app.reset_prompt_state();
+            }
+
+            app.status_msg = format!("✘ Connection failed: {}. Select another provider.", reason);
+            app.set_phase(Phase::Selecting);
+        }
+        TaskResponse::ApiReconnected { api } => {
+            app.api = api;
+            if !matches!(app.phase, Phase::Connecting(_)) {
+                app.status_msg =
+                    "Background API reconnected. Select a provider and press Enter to connect."
+                        .to_string();
+            }
+        }
+        TaskResponse::Disconnected {
+            provider_key,
+            provider_name,
+            rank_success,
+        } => {
+            app.pending_operation = None;
+
+            // Update provider rank in local cache
+            if let Some(p) = app.providers.iter_mut().find(|p| p.key == provider_key) {
+                if rank_success {
+                    p.rank += 1;
+                }
+            }
+            app.sort_providers_by_rank();
+
+            app.status_msg = if rank_success {
+                format!(
+                    "Disconnected from {}. Select a provider and press Enter to connect.",
+                    provider_name
+                )
+            } else {
+                format!(
+                    "Disconnected from {}. Ranking failed. Select a provider and press Enter.",
+                    provider_name
+                )
+            };
+        }
+        TaskResponse::ProviderRanked {
+            provider,
+            good,
+            new_rank,
+        } => {
+            // Update provider rank in local cache
+            if let Some(p) = app.providers.iter_mut().find(|p| p.key == provider) {
+                if good {
+                    p.rank += new_rank;
+                } else {
+                    p.rank -= new_rank.abs();
+                }
+            }
+            app.sort_providers_by_rank();
+        }
+        TaskResponse::Error(msg) => {
+            app.pending_operation = None;
+            app.status_msg = format!("Error: {}. Select a provider and press Enter.", msg);
+            app.set_phase(Phase::Selecting);
+        }
+    }
 }
 
 /// Loads signer key storage from application-specific data directory.
@@ -1087,7 +1324,7 @@ pub async fn upload_file(
 ) -> anyhow::Result<()> {
     const RPC: &str = "wss://hoodi-reth-rpc.gear-tech.io/ws";
     const ROUTER: &str = "0xBC888a8B050B9B76a985d91c815d2c4f2131a58A";
-    const VPN: &str = "0xb59306ae36358a0f126523fd72ea64e2c602d8ea";
+    const VPN: &str = "0xecf8c8bc27e503a4ddf0fb59187fe71d543c50d9";
 
     let provider = parse_provider_key_hex(&provider_key)?;
     let config = std::fs::read_to_string(&file)
@@ -1108,18 +1345,20 @@ pub async fn upload_file(
             prefix, provider, name, kind, config,
         );
 
+    println!("Uploading provider file for key {}...", provider_key);
     let (_, msg_id) = ethereum
         .mirror(contract.into())
         .send_message(message, 0)
         .await
         .context("failed to submit AddProviderFile message")?;
 
+    println!("Waiting for upload result...");
     let reply = ethereum
         .mirror(contract.into())
         .wait_for_reply(msg_id)
         .await
         .context("failed while waiting for AddProviderFile reply")?;
-
+    println!("Upload reply received");
     anyhow::ensure!(
         reply.code.is_success(),
         "upload failed: code {}, message: {}",
