@@ -120,6 +120,12 @@ async fn main() -> anyhow::Result<()> {
                 api,
                 gsigner::Address::from_str(&vpn_address).with_context(|| "Invalid VPN address")?,
                 credentials,
+                tui::ApiReconnectConfig {
+                    validator_endpoint: VARA_ETH_VALIDATOR.to_string(),
+                    eth_rpc: ETH_RPC.to_string(),
+                    router_address,
+                    sender_address: sender_address.into(),
+                },
             )
             .await?
         }
